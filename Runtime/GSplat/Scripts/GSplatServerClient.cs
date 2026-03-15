@@ -16,12 +16,20 @@ namespace Genesis.RoomScan.GSplat
     {
         [SerializeField, Tooltip("IP:port of your PC running the GS training server (gs-server)")]
         string serverUrl = "http://192.168.1.100:8420";
+        [SerializeField, Tooltip("Number of training iterations on the server. Lower = faster but fewer/coarser splats.")]
+        int trainingIterations = 7000;
         [SerializeField, Range(1f, 30f)] float pollIntervalSeconds = 3f;
 
         public string ServerUrl
         {
             get => serverUrl;
             set => serverUrl = value.TrimEnd('/');
+        }
+
+        public int TrainingIterations
+        {
+            get => trainingIterations;
+            set => trainingIterations = Mathf.Max(value, 100);
         }
 
         public bool IsUploading { get; private set; }
@@ -78,8 +86,8 @@ namespace Genesis.RoomScan.GSplat
                 byte[] zipData = await Task.Run(() => CreateZip(exportDir));
                 Debug.Log($"[GSplatServerClient] ZIP created: {zipData.Length / (1024 * 1024)}MB");
 
-                string url = $"{serverUrl}/upload";
-                Debug.Log($"[GSplatServerClient] Uploading to {url}...");
+                string url = $"{serverUrl}/upload?iterations={trainingIterations}";
+                Debug.Log($"[GSplatServerClient] Uploading to {url} ({trainingIterations} iters)...");
 
                 using var request = new UnityWebRequest(url, "POST");
                 request.uploadHandler = new UploadHandlerRaw(zipData);

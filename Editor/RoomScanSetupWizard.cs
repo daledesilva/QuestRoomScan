@@ -1,10 +1,16 @@
 using System.IO;
 using System.Linq;
 using System.Xml.Linq;
+using GaussianSplatting.Runtime;
+using Genesis.RoomScan.GSplat;
+using Genesis.RoomScan.UI;
 using Meta.XR;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.Rendering.Universal;
+using UnityEngine.UIElements;
 using UnityEngine.XR.ARFoundation;
 using Unity.XR.CoreUtils;
 
@@ -30,14 +36,26 @@ namespace Genesis.RoomScan.Editor
         CameraDebugOverlay _cameraDebug;
         DepthDebugOverlay _depthDebug;
         TriplanarCache _triplanarCache;
-        KeyframeStore _keyframeStore;
         RoomScanPersistence _persistence;
         KeyframeCollector _keyframeCollector;
         PointCloudExporter _pointCloudExporter;
-        PlaneDetector _planeDetector;
+        GSplatManager _gsplatManager;
+        GaussianSplatRenderer _ugsRenderer;
+        GSplatServerClient _gsplatServerClient;
+        DebugMenuController _debugMenu;
+        RoomScanInputHandler _inputHandler;
+        EventSystem _eventSystem;
+        OVRInputModule _ovrInputModule;
+        VRDocumentRaycaster _vrRaycaster;
+        ControllerRayDriver _rayDriver;
+        PanelInputConfiguration _panelInputConfig;
 
         bool _depthCaptureWired, _volumeWired, _meshMatWired, _triplanarWired, _computeShaderWired;
+        bool _ugsRendererWired;
+        bool _ugsRenderFeatureAdded;
         bool _boundarylessManifest;
+        bool _cleartextAllowed;
+        bool _insecureHttpAllowed;
 
         // Style
         static readonly Color COL_OK   = new(0.25f, 0.82f, 0.35f);
@@ -47,6 +65,7 @@ namespace Genesis.RoomScan.Editor
         static readonly Color COL_SECT = new(0.18f, 0.18f, 0.22f);
 
         const string PKG = "Packages/com.genesis.roomscan/Runtime/Shaders/";
+        const string GSPLAT_PKG = "Packages/com.genesis.roomscan/Runtime/GSplat/Shaders/";
 
         [MenuItem("RoomScan/Setup Scene")]
         static void Open()
@@ -98,11 +117,19 @@ namespace Genesis.RoomScan.Editor
             _cameraDebug = FindAny<CameraDebugOverlay>();
             _depthDebug = FindAny<DepthDebugOverlay>();
             _triplanarCache = FindAny<TriplanarCache>();
-            _keyframeStore = FindAny<KeyframeStore>();
             _persistence = FindAny<RoomScanPersistence>();
             _keyframeCollector = FindAny<KeyframeCollector>();
             _pointCloudExporter = FindAny<PointCloudExporter>();
-            _planeDetector = FindAny<PlaneDetector>();
+            _gsplatManager = FindAny<GSplatManager>();
+            _ugsRenderer = FindAny<GaussianSplatRenderer>();
+            _gsplatServerClient = FindAny<GSplatServerClient>();
+            _debugMenu = FindAny<DebugMenuController>();
+            _inputHandler = FindAny<RoomScanInputHandler>();
+            _eventSystem = FindAny<EventSystem>();
+            _ovrInputModule = FindAny<OVRInputModule>();
+            _vrRaycaster = FindAny<VRDocumentRaycaster>();
+            _rayDriver = FindAny<ControllerRayDriver>();
+            _panelInputConfig = FindAny<PanelInputConfiguration>();
 
             _depthCaptureWired = _depthCapture != null && AreFieldsAssigned(_depthCapture,
                 "depthNormalCompute", "depthDilationCompute");
@@ -114,8 +141,13 @@ namespace Genesis.RoomScan.Editor
                 "bakeCompute");
             _computeShaderWired = _meshExtractor != null && AreFieldsAssigned(_meshExtractor,
                 "surfaceNetsCompute");
+            _ugsRendererWired = _ugsRenderer != null && AreFieldsAssigned(_ugsRenderer,
+                "m_ShaderSplats", "m_ShaderComposite", "m_ShaderDebugPoints", "m_ShaderDebugBoxes", "m_CSSplatUtilities");
+            _ugsRenderFeatureAdded = HasUGSRenderFeature();
 
             _boundarylessManifest = ManifestHasBoundaryless();
+            _cleartextAllowed = ManifestHasCleartextTraffic();
+            _insecureHttpAllowed = PlayerSettings.insecureHttpOption != InsecureHttpOption.NotAllowed;
         }
 
         // =================================================================
@@ -241,6 +273,8 @@ namespace Genesis.RoomScan.Editor
             BeginSection("PROJECT SETTINGS");
 
             StatusRow("AndroidManifest boundaryless entry", _boundarylessManifest);
+            StatusRow("AndroidManifest cleartext HTTP (LAN)", _cleartextAllowed);
+            StatusRow("Player Settings: Allow HTTP", _insecureHttpAllowed);
 
             if (!_boundarylessManifest)
             {
@@ -250,6 +284,33 @@ namespace Genesis.RoomScan.Editor
                 if (GUILayout.Button("Add Boundaryless Manifest", GUILayout.Width(200)))
                 {
                     FixBoundarylessManifest();
+                    Refresh();
+                }
+                EditorGUILayout.EndHorizontal();
+            }
+
+            if (!_cleartextAllowed)
+            {
+                GUILayout.Space(2);
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Allow Cleartext HTTP", GUILayout.Width(200)))
+                {
+                    FixCleartextTraffic();
+                    Refresh();
+                }
+                EditorGUILayout.EndHorizontal();
+            }
+
+            if (!_insecureHttpAllowed)
+            {
+                GUILayout.Space(2);
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Allow HTTP in Player Settings", GUILayout.Width(200)))
+                {
+                    PlayerSettings.insecureHttpOption = InsecureHttpOption.AlwaysAllowed;
+                    Debug.Log("[RoomScan Setup] Set Player Settings > insecureHttpOption to AlwaysAllowed");
                     Refresh();
                 }
                 EditorGUILayout.EndHorizontal();
@@ -314,6 +375,119 @@ namespace Genesis.RoomScan.Editor
             }
         }
 
+        // -- Cleartext HTTP -----------------------------------------------
+
+        const string ANDROIDLIB_DIR = "Assets/Plugins/Android/NetworkSecurityConfig.androidlib";
+        const string ANDROIDLIB_NSC = ANDROIDLIB_DIR + "/res/xml/network_security_config.xml";
+
+        static bool ManifestHasCleartextTraffic()
+        {
+            string fullPath = Path.Combine(Application.dataPath, "..", MANIFEST_PATH);
+            if (!File.Exists(fullPath)) return false;
+
+            try
+            {
+                var doc = XDocument.Load(fullPath);
+                XNamespace android = "http://schemas.android.com/apk/res/android";
+                var app = doc.Root?.Element("application");
+                if (app == null) return false;
+
+                string val = app.Attribute(android + "usesCleartextTraffic")?.Value;
+                if (val != "true") return false;
+
+                string nscFull = Path.Combine(Application.dataPath, "..", ANDROIDLIB_NSC);
+                return File.Exists(nscFull);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        static void FixCleartextTraffic()
+        {
+            string manifestFull = Path.Combine(Application.dataPath, "..", MANIFEST_PATH);
+
+            if (!File.Exists(manifestFull))
+            {
+                EditorUtility.DisplayDialog("Room Scan Setup",
+                    "AndroidManifest.xml not found at:\n" + MANIFEST_PATH + "\n\n" +
+                    "Build the project once or create a custom manifest first.",
+                    "OK");
+                return;
+            }
+
+            try
+            {
+                var doc = XDocument.Load(manifestFull);
+                XNamespace android = "http://schemas.android.com/apk/res/android";
+                var app = doc.Root?.Element("application");
+                if (app == null) return;
+
+                // android:usesCleartextTraffic="true"
+                var cleartext = app.Attribute(android + "usesCleartextTraffic");
+                if (cleartext == null)
+                    app.Add(new XAttribute(android + "usesCleartextTraffic", "true"));
+                else
+                    cleartext.Value = "true";
+
+                // android:networkSecurityConfig="@xml/network_security_config"
+                var nscAttr = app.Attribute(android + "networkSecurityConfig");
+                if (nscAttr == null)
+                    app.Add(new XAttribute(android + "networkSecurityConfig", "@xml/network_security_config"));
+                else
+                    nscAttr.Value = "@xml/network_security_config";
+
+                doc.Save(manifestFull);
+                Debug.Log("[RoomScan Setup] Added cleartext HTTP attributes to AndroidManifest.xml");
+
+                // Unity 6+ requires Android resources in an .androidlib, not raw res/
+                string libRoot = Path.Combine(Application.dataPath, "..", ANDROIDLIB_DIR);
+                string nscDir = Path.Combine(libRoot, "res", "xml");
+                if (!Directory.Exists(nscDir))
+                    Directory.CreateDirectory(nscDir);
+
+                string nscFull = Path.Combine(nscDir, "network_security_config.xml");
+                if (!File.Exists(nscFull))
+                {
+                    const string nscContent =
+                        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
+                        "<network-security-config>\n" +
+                        "    <base-config cleartextTrafficPermitted=\"true\">\n" +
+                        "        <trust-anchors>\n" +
+                        "            <certificates src=\"system\" />\n" +
+                        "        </trust-anchors>\n" +
+                        "    </base-config>\n" +
+                        "</network-security-config>\n";
+                    File.WriteAllText(nscFull, nscContent);
+                }
+
+                // AndroidManifest.xml for the library module
+                string libManifest = Path.Combine(libRoot, "AndroidManifest.xml");
+                if (!File.Exists(libManifest))
+                {
+                    const string libManifestContent =
+                        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
+                        "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n" +
+                        "    package=\"com.genesis.roomscan.netsecconfig\">\n" +
+                        "</manifest>\n";
+                    File.WriteAllText(libManifest, libManifestContent);
+                }
+
+                // project.properties marks it as a library
+                string projProps = Path.Combine(libRoot, "project.properties");
+                if (!File.Exists(projProps))
+                    File.WriteAllText(projProps, "android.library=true\n");
+
+                Debug.Log($"[RoomScan Setup] Created {ANDROIDLIB_DIR} with network_security_config.xml");
+                AssetDatabase.Refresh();
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogError($"[RoomScan Setup] Failed to enable cleartext traffic: {ex.Message}");
+            }
+        }
+
         // -- Components ---------------------------------------------------
 
         void DrawComponents()
@@ -329,19 +503,32 @@ namespace Genesis.RoomScan.Editor
             StatusRow("CameraDebugOverlay", _cameraDebug != null);
             StatusRow("DepthDebugOverlay", _depthDebug != null);
             StatusRow("TriplanarCache", _triplanarCache != null);
-            StatusRow("KeyframeStore", _keyframeStore != null);
             StatusRow("RoomScanPersistence", _persistence != null);
             StatusRow("KeyframeCollector (GS export)", _keyframeCollector != null);
             StatusRow("PointCloudExporter (GS export)", _pointCloudExporter != null);
-            StatusRow("PlaneDetector (mesh regularization)", _planeDetector != null);
+            StatusRow("GSplatManager (PLY loader)", _gsplatManager != null);
+            StatusRow("GaussianSplatRenderer (UGS)", _ugsRenderer != null);
+            StatusRow("GSplatServerClient (PC training)", _gsplatServerClient != null);
+            StatusRow("DebugMenuController (HUD)", _debugMenu != null);
+            StatusRow("RoomScanInputHandler (bindings)", _inputHandler != null);
+            StatusRow("EventSystem + OVRInputModule", _eventSystem != null && _ovrInputModule != null);
+            StatusRow("VRDocumentRaycaster (UI pointer)", _vrRaycaster != null);
+            StatusRow("ControllerRayDriver (laser)", _rayDriver != null);
+            StatusRow("PanelInputConfiguration", _panelInputConfig != null);
 
             bool anyMissing = _depthCapture == null || _volumeIntegrator == null ||
                               _meshExtractor == null ||
                               _roomScanner == null || _cameraProvider == null ||
                               _pcaComponent == null || _cameraDebug == null ||
-                              _triplanarCache == null || _keyframeStore == null ||
+                              _triplanarCache == null ||
                               _persistence == null || _keyframeCollector == null ||
-                              _pointCloudExporter == null || _planeDetector == null;
+                              _pointCloudExporter == null ||
+                              _gsplatManager == null || _ugsRenderer == null ||
+                              _gsplatServerClient == null ||
+                              _debugMenu == null || _inputHandler == null ||
+                              _eventSystem == null || _ovrInputModule == null ||
+                              _vrRaycaster == null || _rayDriver == null ||
+                              _panelInputConfig == null;
 
             if (anyMissing)
             {
@@ -375,52 +562,108 @@ namespace Genesis.RoomScan.Editor
                 }
             }
 
-            if (root.GetComponent<DepthCapture>() == null)
-                Undo.AddComponent<DepthCapture>(root);
-            if (root.GetComponent<VolumeIntegrator>() == null)
-                Undo.AddComponent<VolumeIntegrator>(root);
-            if (root.GetComponent<MeshExtractor>() == null)
-                Undo.AddComponent<MeshExtractor>(root);
+            // PassthroughCameraAccess isn't pulled in by RequireComponent
             if (root.GetComponent<PassthroughCameraAccess>() == null)
                 Undo.AddComponent<PassthroughCameraAccess>(root);
-            if (root.GetComponent<PassthroughCameraProvider>() == null)
-                Undo.AddComponent<PassthroughCameraProvider>(root);
+
+            // Adding RoomScanner auto-adds all [RequireComponent] siblings:
+            // DepthCapture, VolumeIntegrator, MeshExtractor,
+            // PassthroughCameraProvider, TriplanarCache, RoomScanPersistence,
+            // KeyframeCollector, PointCloudExporter, GSplatManager,
+            // GSplatServerClient (which also pulls GaussianSplatRenderer via RequireComponent)
             if (root.GetComponent<RoomScanner>() == null)
                 Undo.AddComponent<RoomScanner>(root);
+
+            // Optional components not covered by RequireComponent
+            if (root.GetComponent<RoomScanInputHandler>() == null)
+                Undo.AddComponent<RoomScanInputHandler>(root);
+
+            // Debug overlays — disabled by default
             if (root.GetComponent<CameraDebugOverlay>() == null)
             {
-                var camDebug = Undo.AddComponent<CameraDebugOverlay>(root);
-                camDebug.enabled = false;
+                var c = Undo.AddComponent<CameraDebugOverlay>(root);
+                c.enabled = false;
             }
             if (root.GetComponent<DepthDebugOverlay>() == null)
             {
-                var depthDebug = Undo.AddComponent<DepthDebugOverlay>(root);
-                depthDebug.enabled = false;
+                var c = Undo.AddComponent<DepthDebugOverlay>(root);
+                c.enabled = false;
             }
-            if (root.GetComponent<TriplanarCache>() == null)
-                Undo.AddComponent<TriplanarCache>(root);
-            if (root.GetComponent<KeyframeStore>() == null)
-                Undo.AddComponent<KeyframeStore>(root);
-            if (root.GetComponent<RoomScanPersistence>() == null)
-                Undo.AddComponent<RoomScanPersistence>(root);
-            if (root.GetComponent<KeyframeCollector>() == null)
+
+            // DebugMenu lives on a child (needs UIDocument)
+            if (FindAny<DebugMenuController>() == null)
             {
-                var keyframeCollector = Undo.AddComponent<KeyframeCollector>(root);
-                keyframeCollector.enabled = false;
+                var debugGo = new GameObject("DebugMenu");
+                debugGo.transform.SetParent(root.transform);
+                Undo.RegisterCreatedObjectUndo(debugGo, "Create DebugMenu");
+
+                Undo.AddComponent<UIDocument>(debugGo);
+                Undo.AddComponent<DebugMenuController>(debugGo);
             }
-            if (root.GetComponent<PointCloudExporter>() == null)
-            {
-                var pointCloudExporter = Undo.AddComponent<PointCloudExporter>(root);
-                pointCloudExporter.enabled = false;
-            }
-            if (root.GetComponent<PlaneDetector>() == null)
-            {
-                var planeDetector = Undo.AddComponent<PlaneDetector>(root);
-                planeDetector.enabled = false;
-            }
+
+            // Always ensure UIDocument has its assets assigned
+            EnsureDebugMenuAssets();
+
+            // Auto-configure GS training server URL with this PC's LAN IP
+            ConfigureServerUrl();
+
+            // EventSystem + VR controller UI input pipeline
+            EnsureVRInputInfrastructure();
 
             MarkDirty();
             Refresh();
+        }
+
+        /// <summary>
+        /// Sets up EventSystem, OVRInputModule, PanelInputConfiguration,
+        /// VRDocumentRaycaster, and ControllerRayDriver so that VR controller
+        /// rays can interact with world-space UI Toolkit panels.
+        /// </summary>
+        void EnsureVRInputInfrastructure()
+        {
+            // EventSystem
+            var es = FindAny<EventSystem>();
+            if (es == null)
+            {
+                var esGo = new GameObject("EventSystem");
+                Undo.RegisterCreatedObjectUndo(esGo, "Create EventSystem");
+                es = Undo.AddComponent<EventSystem>(esGo);
+            }
+
+            // OVRInputModule (replaces StandaloneInputModule for VR)
+            if (es.GetComponent<OVRInputModule>() == null)
+            {
+                // Remove StandaloneInputModule if present — only one input module should be active
+                var standalone = es.GetComponent<StandaloneInputModule>();
+                if (standalone != null) Undo.DestroyObjectImmediate(standalone);
+
+                Undo.AddComponent<OVRInputModule>(es.gameObject);
+            }
+
+            // PanelInputConfiguration (auto-creates PanelEventHandler per panel)
+            if (es.GetComponent<PanelInputConfiguration>() == null)
+            {
+                var pic = Undo.AddComponent<PanelInputConfiguration>(es.gameObject);
+                var so = new SerializedObject(pic);
+                SetBool(so, "m_DefaultEventCameraIsMainCamera", true);
+                SetBool(so, "m_AutoCreatePanelComponents", true);
+                so.ApplyModifiedProperties();
+                EditorUtility.SetDirty(pic);
+            }
+
+            // VRDocumentRaycaster (overrides GetWorldRay for controller rays)
+            if (es.GetComponent<VRDocumentRaycaster>() == null)
+                Undo.AddComponent<VRDocumentRaycaster>(es.gameObject);
+
+            // ControllerRayDriver (laser visual + auto-picks active controller)
+            if (es.GetComponent<ControllerRayDriver>() == null)
+                Undo.AddComponent<ControllerRayDriver>(es.gameObject);
+        }
+
+        static void SetBool(SerializedObject so, string fieldName, bool value)
+        {
+            var prop = so.FindProperty(fieldName);
+            if (prop != null) prop.boolValue = value;
         }
 
         // -- Shader / Material Wiring ------------------------------------
@@ -434,10 +677,13 @@ namespace Genesis.RoomScan.Editor
             StatusRow("MeshExtractor scan material", _meshMatWired);
             StatusRow("TriplanarCache bake compute", _triplanarWired);
             StatusRow("SurfaceNetsExtract compute shader", _computeShaderWired);
+            StatusRow("UGS renderer shaders + compute", _ugsRendererWired);
+            StatusRow("UGS RenderFeature on URP Renderer", _ugsRenderFeatureAdded);
 
             bool needsFix = !_depthCaptureWired || !_volumeWired ||
                             !_meshMatWired || !_triplanarWired ||
-                            !_computeShaderWired;
+                            !_computeShaderWired ||
+                            !_ugsRendererWired || !_ugsRenderFeatureAdded;
             if (needsFix)
             {
                 GUILayout.Space(2);
@@ -506,6 +752,23 @@ namespace Genesis.RoomScan.Editor
                 EditorUtility.SetDirty(_meshExtractor);
             }
 
+            // UGS GaussianSplatRenderer — shaders + compute
+            if (_ugsRenderer != null)
+            {
+                const string UGS_PKG = "Packages/org.nesnausk.gaussian-splatting/Shaders/";
+                var so = new SerializedObject(_ugsRenderer);
+                AssignAsset<Shader>(so, "m_ShaderSplats", UGS_PKG + "RenderGaussianSplats.shader");
+                AssignAsset<Shader>(so, "m_ShaderComposite", UGS_PKG + "GaussianComposite.shader");
+                AssignAsset<Shader>(so, "m_ShaderDebugPoints", UGS_PKG + "GaussianDebugRenderPoints.shader");
+                AssignAsset<Shader>(so, "m_ShaderDebugBoxes", UGS_PKG + "GaussianDebugRenderBoxes.shader");
+                AssignCompute(so, "m_CSSplatUtilities", UGS_PKG + "SplatUtilities.compute");
+                so.ApplyModifiedProperties();
+                EditorUtility.SetDirty(_ugsRenderer);
+            }
+
+            if (!_ugsRenderFeatureAdded)
+                AddUGSRenderFeature();
+
             MarkDirty();
             Refresh();
         }
@@ -555,6 +818,97 @@ namespace Genesis.RoomScan.Editor
             return mat;
         }
 
+        static Material GetOrCreateSplatMaterial()
+        {
+            const string pkgMatPath = "Packages/com.genesis.roomscan/Runtime/GSplat/Materials/SplatRender.mat";
+            var pkgMat = AssetDatabase.LoadAssetAtPath<Material>(pkgMatPath);
+            if (pkgMat != null) return pkgMat;
+
+            Shader shader = Shader.Find("Genesis/SplatRender");
+            if (shader == null)
+            {
+                Debug.LogWarning("[RoomScan Setup] Shader 'Genesis/SplatRender' not found");
+                return null;
+            }
+
+            if (!AssetDatabase.IsValidFolder("Assets/RoomScan"))
+                AssetDatabase.CreateFolder("Assets", "RoomScan");
+
+            var mat = new Material(shader) { name = "SplatRender" };
+            const string matPath = "Assets/RoomScan/SplatRender.mat";
+            AssetDatabase.CreateAsset(mat, matPath);
+            AssetDatabase.SaveAssets();
+            return mat;
+        }
+
+        // -- URP Renderer Feature -----------------------------------------
+
+        static UniversalRendererData FindActiveRendererData()
+        {
+            var pipeline = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline
+                as UniversalRenderPipelineAsset;
+            if (pipeline == null) return null;
+
+            var so = new SerializedObject(pipeline);
+            var list = so.FindProperty("m_RendererDataList");
+            if (list == null || list.arraySize == 0) return null;
+
+            return list.GetArrayElementAtIndex(0).objectReferenceValue
+                as UniversalRendererData;
+        }
+
+        static bool HasUGSRenderFeature()
+        {
+            var rd = FindActiveRendererData();
+            if (rd == null) return false;
+            foreach (var f in rd.rendererFeatures)
+            {
+                if (f != null && f.GetType().Name == "GaussianSplatURPFeature") return true;
+            }
+            return false;
+        }
+
+        static void AddUGSRenderFeature()
+        {
+            var rd = FindActiveRendererData();
+            if (rd == null)
+            {
+                Debug.LogWarning("[RoomScan Setup] No active URP RendererData found");
+                return;
+            }
+
+            // Find the GaussianSplatURPFeature type from the UGS assembly
+            System.Type featureType = null;
+            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                featureType = asm.GetType("GaussianSplatting.Runtime.GaussianSplatURPFeature");
+                if (featureType != null) break;
+            }
+            if (featureType == null)
+            {
+                Debug.LogWarning("[RoomScan Setup] GaussianSplatURPFeature type not found — " +
+                    "ensure UGS package has GS_ENABLE_URP defined and Unity 6+");
+                return;
+            }
+
+            var feature = (ScriptableRendererFeature)CreateInstance(featureType);
+            feature.name = "Gaussian Splat Renderer";
+            feature.SetActive(true);
+
+            Undo.RecordObject(rd, "Add UGS Render Feature");
+            AssetDatabase.AddObjectToAsset(feature, rd);
+
+            var so = new SerializedObject(rd);
+            var features = so.FindProperty("m_RendererFeatures");
+            features.arraySize++;
+            features.GetArrayElementAtIndex(features.arraySize - 1).objectReferenceValue = feature;
+            so.ApplyModifiedProperties();
+
+            EditorUtility.SetDirty(rd);
+            AssetDatabase.SaveAssets();
+            Debug.Log("[RoomScan Setup] Added GaussianSplatURPFeature to URP Renderer");
+        }
+
         // -- Master Button ------------------------------------------------
 
         void DrawMasterButton()
@@ -585,39 +939,22 @@ namespace Genesis.RoomScan.Editor
             if (_arSession == null) FixARSession();
             if (_arOcclusion == null) FixAROcclusion();
             if (!_boundarylessManifest) FixBoundarylessManifest();
+            if (!_cleartextAllowed) FixCleartextTraffic();
+            if (!_insecureHttpAllowed)
+            {
+                PlayerSettings.insecureHttpOption = InsecureHttpOption.AlwaysAllowed;
+                Debug.Log("[RoomScan Setup] Set Player Settings > insecureHttpOption to AlwaysAllowed");
+            }
             FixComponents();
             FixShaderWiring();
 
-            // Wire RoomScanner references to sibling components
-            Refresh();
-            if (_roomScanner != null)
-            {
-                var so = new SerializedObject(_roomScanner);
-                SetRef(so, "depthCapture", _depthCapture);
-                SetRef(so, "volumeIntegrator", _volumeIntegrator);
-                SetRef(so, "meshExtractor", _meshExtractor);
-                SetRef(so, "cameraProvider", _cameraProvider);
-                SetRef(so, "triplanarCache", _triplanarCache);
-                SetRef(so, "keyframeStore", _keyframeStore);
-                SetRef(so, "persistence", _persistence);
-                SetRef(so, "keyframeCollector", _keyframeCollector);
-                SetRef(so, "pointCloudExporter", _pointCloudExporter);
-                SetRef(so, "planeDetector", _planeDetector);
-                so.ApplyModifiedProperties();
-                EditorUtility.SetDirty(_roomScanner);
-            }
+            // RoomScanner and GSplatManager resolve siblings via GetComponent —
+            // no serialized wiring needed.
 
             MarkDirty();
             Refresh();
 
             Debug.Log("[RoomScan Setup] Scene setup complete.");
-        }
-
-        static void SetRef(SerializedObject so, string field, Object value)
-        {
-            var prop = so.FindProperty(field);
-            if (prop != null && prop.objectReferenceValue == null && value != null)
-                prop.objectReferenceValue = value;
         }
 
         // =================================================================
@@ -722,5 +1059,148 @@ namespace Genesis.RoomScan.Editor
         static void MarkDirty() =>
             EditorSceneManager.MarkSceneDirty(
                 UnityEngine.SceneManagement.SceneManager.GetActiveScene());
+
+        /// <summary>
+        /// Sets m_RenderMode to 1 (WorldSpace). The public renderMode property
+        /// and PanelRenderMode enum are internal in Unity 6000.3.
+        /// </summary>
+        static void SetPanelRenderModeWorldSpace(PanelSettings panel)
+        {
+            const int WorldSpace = 1;
+            var so = new SerializedObject(panel);
+            var prop = so.FindProperty("m_RenderMode");
+            if (prop != null && prop.intValue != WorldSpace)
+            {
+                prop.intValue = WorldSpace;
+                so.ApplyModifiedProperties();
+                EditorUtility.SetDirty(panel);
+            }
+        }
+
+        static void EnsureDebugMenuAssets()
+        {
+            var ctrl = FindAny<DebugMenuController>();
+            if (ctrl == null) return;
+
+            var uiDoc = ctrl.GetComponent<UIDocument>();
+            if (uiDoc == null) return;
+
+            Undo.RecordObject(uiDoc, "Assign DebugMenu UIDocument assets");
+
+            if (uiDoc.visualTreeAsset == null)
+            {
+                var uxml = AssetDatabase.LoadAssetAtPath<VisualTreeAsset>(
+                    "Packages/com.genesis.roomscan/Runtime/UI/DebugMenu.uxml");
+                if (uxml != null) uiDoc.visualTreeAsset = uxml;
+            }
+
+            if (uiDoc.panelSettings == null)
+            {
+                var panel = FindOrCreatePanelSettings();
+                if (panel != null) uiDoc.panelSettings = panel;
+            }
+
+            // Ensure PanelSettings is configured for world-space VR rendering.
+            // renderMode / PanelRenderMode are internal in 6000.3; use SerializedObject.
+            if (uiDoc.panelSettings != null)
+                SetPanelRenderModeWorldSpace(uiDoc.panelSettings);
+
+            // World-space UIDocument properties:
+            // - Dynamic size mode: panel auto-sizes to the content layout (480×640 from USS)
+            // - Pivot = Center: transform position = center of the visible panel
+            // - PivotReferenceSize = Layout: pivot calculated from root element layout, not bounding box
+            uiDoc.worldSpaceSizeMode = UIDocument.WorldSpaceSizeMode.Dynamic;
+            uiDoc.pivot = Pivot.Center;
+            uiDoc.pivotReferenceSize = PivotReferenceSize.Layout;
+
+            // 480px / 100 PPU = 4.8 local units. Scale 0.08 → 0.384m wide.
+            const float worldScale = 0.08f;
+            if (Mathf.Abs(ctrl.transform.localScale.x - worldScale) > 0.01f)
+            {
+                Undo.RecordObject(ctrl.transform, "Scale DebugMenu for VR");
+                ctrl.transform.localScale = Vector3.one * worldScale;
+            }
+
+            EditorUtility.SetDirty(uiDoc);
+        }
+
+        static PanelSettings FindOrCreatePanelSettings()
+        {
+            const string assetName = "DebugMenuPanelSettings";
+
+            string[] guids = AssetDatabase.FindAssets($"t:PanelSettings {assetName}");
+            if (guids.Length > 0)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guids[0]);
+                var existing = AssetDatabase.LoadAssetAtPath<PanelSettings>(path);
+                if (existing != null) return existing;
+            }
+
+            const string dir = "Assets/Settings";
+            if (!AssetDatabase.IsValidFolder(dir))
+                AssetDatabase.CreateFolder("Assets", "Settings");
+
+            const string assetPath = dir + "/" + assetName + ".asset";
+            var panel = ScriptableObject.CreateInstance<PanelSettings>();
+            AssetDatabase.CreateAsset(panel, assetPath);
+            SetPanelRenderModeWorldSpace(panel);
+            AssetDatabase.SaveAssets();
+            Debug.Log($"[RoomScanWizard] Created PanelSettings (WorldSpace) at {assetPath}");
+            return panel;
+        }
+
+        /// <summary>
+        /// Auto-detect this PC's LAN IP and write it into the GSplatServerClient
+        /// serialized field so the Quest connects to the right address at runtime.
+        /// </summary>
+        static void ConfigureServerUrl()
+        {
+            var client = FindAny<GSplatServerClient>();
+            if (client == null) return;
+
+            string lanIp = GetLanIp();
+            if (string.IsNullOrEmpty(lanIp)) return;
+
+            string url = $"http://{lanIp}:8420";
+
+            var so = new SerializedObject(client);
+            var prop = so.FindProperty("serverUrl");
+            if (prop != null && prop.stringValue != url)
+            {
+                prop.stringValue = url;
+                so.ApplyModifiedProperties();
+                EditorUtility.SetDirty(client);
+                Debug.Log($"[RoomScanWizard] Server URL set to {url} (detected LAN IP: {lanIp})");
+            }
+        }
+
+        static string GetLanIp()
+        {
+            try
+            {
+                foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up)
+                        continue;
+                    if (ni.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback)
+                        continue;
+
+                    var props = ni.GetIPProperties();
+                    foreach (var addr in props.UnicastAddresses)
+                    {
+                        if (addr.Address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+                            continue;
+                        string ip = addr.Address.ToString();
+                        if (ip.StartsWith("127.")) continue;
+                        return ip;
+                    }
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning($"[RoomScanWizard] Failed to detect LAN IP: {e.Message}");
+            }
+            return null;
+        }
     }
 }

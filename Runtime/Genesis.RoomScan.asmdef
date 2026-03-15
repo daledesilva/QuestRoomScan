@@ -9,7 +9,11 @@
     "Unity.Collections",
     "Unity.Mathematics",
     "Unity.RenderPipelines.Universal.Runtime",
-    "meta.xr.mrutilitykit"
+    "Unity.RenderPipelines.Core.Runtime",
+    "meta.xr.mrutilitykit",
+    "Oculus.VR",
+    "UnityEngine.UI",
+    "GaussianSplatting"
   ],
   "includePlatforms": [],
   "excludePlatforms": [],

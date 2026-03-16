@@ -68,10 +68,12 @@ Or clone locally and reference as local packages:
 
 ## Quick Start
 
-1. Open the setup wizard: **RoomScan > Setup Scene**
-2. The wizard checks prerequisites (AR Session, OVRCameraRig/XROrigin, AROcclusionManager), configures project settings (boundaryless manifest, cleartext HTTP for LAN server), and adds all required components — including `GaussianSplatRenderer` with UGS shaders, the URP render feature, VR input handlers, and debug menu
-3. Build and deploy to Quest 3
-4. The room mesh appears as you look around — surfaces solidify with repeated observations
+1. Create a new blank URP scene
+2. Add a **Camera Rig** and **Passthrough** from Meta's Building Blocks (`Menu > Meta > Building Blocks`). The Camera Rig provides `OVRCameraRig` and the Passthrough block enables the passthrough layer — both are required before running the wizard.
+3. Open the setup wizard: **RoomScan > Setup Scene**
+4. The wizard checks prerequisites (AR Session, AROcclusionManager), configures project settings (boundaryless manifest, cleartext HTTP for LAN server), and adds all required components — including `GaussianSplatRenderer` with UGS shaders, the URP render feature, VR input handlers, and debug menu
+5. Build and deploy to Quest 3
+6. The room mesh appears as you look around — surfaces solidify with repeated observations
 
 ## Usage Flow
 

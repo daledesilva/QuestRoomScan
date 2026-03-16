@@ -6,13 +6,13 @@ Real-time 3D room reconstruction on Meta Quest 3. Produces a textured mesh from 
 
 - **GPU TSDF Integration** — Depth frames fused into a signed distance field via compute shaders
 - **GPU Surface Nets Meshing** — Fully GPU-driven mesh extraction via compute shaders with zero CPU readback, rendered via a single `Graphics.RenderPrimitivesIndirect` draw call
-- **Three-Layer Texturing** — Keyframe ring buffer (pixel-level) → triplanar world-space cache (persistent) → vertex colors (fallback)
-- **Mesh Persistence** — Save/load full scan state (TSDF + color volumes + triplanar textures) to disk
+- **Three-Layer Texturing** — Triplanar world-space cache (persistent ~8mm/texel) → vertex colors (~5cm fallback) — all sourced from passthrough camera RGB. Keyframes captured as motion-gated JPEGs to disk for Gaussian Splat training.
+- **Mesh Persistence** — Save/load full scan state (TSDF + color volumes + triplanar textures) to disk, auto-save on quit
 - **Temporal Stabilization** — Adaptive per-vertex temporal blending on GPU prevents mesh jitter while allowing fast convergence
-- **Exclusion Zones** — Cylindrical rejection around tracked heads prevents body reconstruction
+- **Exclusion Zones** — Cylindrical rejection around tracked heads prevents body reconstruction (configurable radius and height, up to 64 zones)
 - **Gaussian Splat Training & Rendering** — Keyframe capture + point cloud export → PC server training → trained PLY download → on-device UGS rendering
-- **VR Debug Menu** — World-space UI Toolkit menu (controller ray interaction, lazy-follow) for live status, render mode toggle, training control, and data management
-- **Render Mode Switching** — Toggle between mesh, Gaussian splat, and combined views at runtime via debug menu or controller binding
+- **VR Debug Menu** — World-space UI Toolkit panel with controller ray interaction, lazy-follow gaze tracking, live status, server training controls, persistence management, and FPS display
+- **Render Mode Switching** — Cycle between Mesh, Splat, and Both views at runtime via debug menu or controller binding (default: A/X button)
 
 ## Requirements
 
@@ -25,13 +25,17 @@ Real-time 3D room reconstruction on Meta Quest 3. Produces a textured mesh from 
 | Package | Version | Notes |
 |---------|---------|-------|
 | `com.unity.xr.arfoundation` | 6.1+ | Depth frame access |
-| `com.unity.xr.meta-openxr` | 2.1+ | Bridges Meta depth to AR Foundation |
-| `com.unity.xr.openxr` | 1.15+ | OpenXR runtime |
+| `com.unity.render-pipelines.universal` | 17.0+ | URP rendering pipeline |
 | `com.meta.xr.mrutilitykit` | 85+ | Passthrough camera RGB access |
 | `com.unity.burst` | 1.8+ | Required by Collections/Mathematics |
 | `com.unity.collections` | 2.4+ | NativeArray for plane detection |
 | `com.unity.mathematics` | 1.3+ | Math types used throughout |
 | `org.nesnausk.gaussian-splatting` | [fork](https://github.com/arghyasur1991/UnityGaussianSplatting) | Gaussian splat rendering with runtime PLY loading |
+
+Additional project-level dependencies (not in `package.json` — installed via Meta's SDK or XR plugin management):
+- `com.unity.xr.meta-openxr` (bridges Meta depth to AR Foundation)
+- `com.unity.xr.openxr` (OpenXR runtime)
+- `com.meta.xr.sdk.core` (OVRInput, OVRCameraRig)
 
 ### Android Permissions
 
@@ -65,30 +69,33 @@ Or clone locally and reference as local packages:
 ## Quick Start
 
 1. Open the setup wizard: **RoomScan > Setup Scene**
-2. The wizard checks prerequisites (AR Session, XR Camera Rig, Occlusion Manager) and adds all required components — including `GaussianSplatRenderer` with UGS shaders and the URP render feature
+2. The wizard checks prerequisites (AR Session, OVRCameraRig/XROrigin, AROcclusionManager), configures project settings (boundaryless manifest, cleartext HTTP for LAN server), and adds all required components — including `GaussianSplatRenderer` with UGS shaders, the URP render feature, VR input handlers, and debug menu
 3. Build and deploy to Quest 3
 4. The room mesh appears as you look around — surfaces solidify with repeated observations
 
 ### Architecture
 
 ```
-DepthCapture (AR depth frames → normals → dilation)
+PassthroughCameraProvider (RGB frames from headset cameras)
        │
-VolumeIntegrator (TSDF integrate → warmup clear → prune)
+DepthCapture (AROcclusionManager → depth → normals → dilation)
+       │
+VolumeIntegrator (TSDF + color integration, exclusion zones, prune, freeze)
        │
 MeshExtractor → GPUSurfaceNets (compute: classify → smooth → snap → temporal → index)
        │         └── GPUMeshRenderer (Graphics.RenderPrimitivesIndirect, single draw call)
        │
-       ├── TriplanarCache (bake camera → 3 world-space textures)
-       └── KeyframeCollector (ring buffer of camera frames → GSExport/)
-                │
-                ├── PointCloudExporter (GPU mesh → binary PLY)
-                │
-                └── GSplatServerClient ──► PC Server (upload ZIP → train → download PLY)
-                                               │
-                                    GSplatManager + GaussianSplatRenderer (UGS)
-                                               │
-                                    On-device Gaussian Splat rendering
+       ├── TriplanarCache (bake camera RGB → 3 world-space textures)
+       │
+       ├── KeyframeCollector (motion-gated JPEG + poses → GSExport/ on disk)
+       │
+       ├── PointCloudExporter (GPU mesh → points3d.ply via AsyncGPUReadback)
+       │
+       └── GSplatServerClient (ZIP upload → poll status → PLY download)
+                   │
+                   GSplatManager + GaussianSplatRenderer (UGS)
+                   │
+                   On-device Gaussian Splat rendering
 ```
 
 See [ALGORITHM.md](ALGORITHM.md) for the full technical reference.
@@ -99,44 +106,35 @@ QuestRoomScan captures keyframes and a dense point cloud during scanning, upload
 
 ### On-Device (automatic capture)
 
-- **KeyframeCollector**: Motion-gated JPEG frames + camera poses saved to `GSExport/`
-- **PointCloudExporter**: GPU mesh vertices exported as binary PLY via async readback
+- **KeyframeCollector**: Motion-gated JPEG frames + camera poses saved to `GSExport/` on disk (`images/*.jpg`, `frames.jsonl`)
+- **PointCloudExporter**: GPU mesh vertices exported as binary PLY (`points3d.ply`) via `AsyncGPUReadback`
 
 ### Server Training (via [RoomScan-GaussianSplatServer](https://github.com/arghyasur1991/RoomScan-GaussianSplatServer))
 
 The companion PC server handles the full training pipeline:
 
 ```bash
-cd gs-server/server && python main.py --port 8420
-cd gs-server/web && npm run dev  # Dashboard at http://localhost:5173
+python main.py --port 8420  # API server
+npm run dev                  # Dashboard at http://localhost:5173
 ```
 
 The flow:
-1. **Upload**: Quest sends a ZIP of keyframes + point cloud to the server (with configurable training iterations via `GSplatServerClient.trainingIterations`)
-2. **Convert**: Server converts Unity poses + intrinsics to COLMAP binary format, computes scene normalization parameters
-3. **Train**: Gaussian Splat training via msplat (Metal), gsplat (CUDA), or 3DGS
-4. **Denormalize**: Output PLY is transformed back to world coordinates (reverses nerfstudio-style scene normalization)
-5. **Download**: Quest downloads the trained PLY
-6. **Render**: `GSplatManager` calls `GaussianSplatPlyLoader.LoadFromPlyBytes()` to parse PLY at runtime, convert to UGS internal format, and render via `GaussianSplatRenderer`
+1. **Export**: Point cloud exported from GPU mesh; keyframes already on disk from scanning
+2. **Upload**: Quest ZIPs `GSExport/` contents (`frames.jsonl`, `points3d.ply`, `images/*.jpg`) and POSTs to `{serverUrl}/upload?iterations={N}`
+3. **Train**: Server converts Unity poses + intrinsics to COLMAP binary format, trains via msplat/gsplat/3DGS
+4. **Poll**: Quest polls `{serverUrl}/api/status` every ~3s — debug menu shows state, progress, iteration, elapsed, backend
+5. **Download**: Quest GETs `{serverUrl}/download` → trained PLY bytes
+6. **Render**: `GSplatManager` loads PLY via `GaussianSplatPlyLoader.LoadFromPlyBytes()` → `GaussianSplatRenderer` renders on-device
 
 ### On-Device Rendering (UGS)
 
-Trained splats are rendered using a [fork of Unity Gaussian Splatting](https://github.com/arghyasur1991/UnityGaussianSplatting) with added runtime PLY loading:
+Trained splats are rendered using a [fork of Unity Gaussian Splatting](https://github.com/arghyasur1991/UnityGaussianSplatting) with runtime PLY loading and Quest 3 optimizations:
 
-- **`GaussianSplatPlyLoader`**: Parses binary PLY → converts to UGS VeryHigh (Float32) format → creates GPU buffers directly (no Editor asset pipeline needed)
-- **`GaussianSplatRenderer.SetRuntimeSplatData()`**: Accepts pre-built GPU buffer data, bypassing TextAsset/ScriptableObject requirements
+- **`GaussianSplatPlyLoader`**: Parses binary PLY → converts to UGS internal format → creates GPU buffers directly (no Editor asset pipeline needed)
 - **Coordinate conversion**: COLMAP (right-handed Y-down) → Unity (left-handed Y-up)
-- **Quest 3 stereo**: Per-eye matrices for correct VR covariance projection, shared covariance/SH between eyes, max splat count limiter, `clip()` over `discard` for Adreno TBDR
-- **Render mode switching**: Mesh, Splat, or Both — toggled via debug menu or controller binding without releasing GPU resources
-
-### Debug Menu
-
-A world-space UI Toolkit menu accessible via the Quest's Menu button:
-
-- **Live status**: Scan state, render mode, volume stats, training progress
-- **Actions**: Start/Stop scanning, Save/Load scan, Start GS training, Switch render mode, Clear data
-- **Training status**: Upload/download progress, training state, iteration count
-- **Lazy-follow**: Panel follows head gaze with smooth damping
+- **Quest 3 stereo**: Per-eye VP matrices for correct VR covariance projection, shared compute between eyes
+- **Performance**: Reduced-resolution rendering (0.5x), optimized compute shaders, partial radix sort, contribution-based culling
+- **Render mode switching**: Mesh, Splat, or Both — cycled via debug menu or controller binding without releasing GPU resources
 
 ### Supported Training Backends
 
@@ -146,16 +144,45 @@ A world-space UI Toolkit menu accessible via the Quest's Menu button:
 | [gsplat](https://github.com/nerfstudio-project/gsplat) | NVIDIA GPU (CUDA) | `pip install gsplat` |
 | [3DGS](https://github.com/graphdeco-inria/gaussian-splatting) | NVIDIA GPU (CUDA) | Clone repo, pass `--gs-repo` |
 
+## VR Debug Menu
+
+World-space UI Toolkit panel activated via **left thumbstick click** (Quest OS reserves the Menu/Start button for system use). Uses controller ray interaction with trigger to click.
+
+**Lazy-follow**: Panel floats at 0.75m, re-centers when gaze drifts past 45 degrees.
+
+| Section | Contents |
+|---------|----------|
+| **Scan Status** | Scanning state, render mode, integration count, keyframe count, render info |
+| **Server Training** | Editable server URL, training state, progress bar, iteration count, elapsed time, backend name, status message |
+| **Persistence** | Saved scan info, GSExport directory status |
+| **Actions** | Toggle Scan, Cycle Render Mode, Save Scan, Load Scan, Export Point Cloud, Start GS Training, Cancel Training, Clear All Data |
+| **Footer** | Live FPS counter |
+
+### Default Controller Bindings
+
+| Button | Action |
+|--------|--------|
+| Left Thumbstick Click | Toggle Debug Menu |
+| One (Y/B) | Freeze In View |
+| Two (X/A) | Unfreeze In View |
+| Three (A/X) | Cycle Render Mode |
+| Four (B/Y) | Start Server Training (disabled by default) |
+
+Bindings are fully configurable via `RoomScanInputHandler` — add, remove, or remap any `ScanAction` to any `OVRInput.Button`.
+
 ## Memory Budget (Quest 3)
 
-| Component | Memory |
-|-----------|--------|
-| TSDF volume (160x128x160, RG8) | ~6.5 MB |
-| Color volume (160x128x160, RGBA8) | ~13 MB |
-| GPU Surface Nets (coord map, vertices, indices, smoothing, temporal 3D texture) | ~83 MB |
-| Triplanar textures (3x 1024x1024, RGBA8) | ~12 MB |
-| Keyframe ring buffer (8x 1280x960, RGBA8) | ~40 MB |
-| **Total GPU** | **~155 MB** |
+Default values — all configurable per-component in the Inspector.
+
+| Component | Default | Memory |
+|-----------|---------|--------|
+| TSDF volume (RG8_SNorm) | 256 x 256 x 256 | ~32 MB |
+| Color volume (RGBA8) | 256 x 256 x 256 | ~64 MB |
+| GPU Surface Nets (coord map, vertices, indices, smoothing, temporal 3D texture) | 256³ derived | ~83 MB |
+| Triplanar textures (3x RGBA8) | 3 x 4096 x 4096 | ~192 MB |
+| **Total GPU** | | **~371 MB** |
+
+Keyframes are written as JPEGs to disk (not held in GPU memory). To reduce GPU memory on constrained devices, lower `VolumeIntegrator.voxelCount` and `TriplanarCache.textureResolution` in the Inspector.
 
 ## Comparison with Hyperscape
 
@@ -184,8 +211,8 @@ QuestRoomScan builds on that foundation with significant extensions:
 | | lasertag | QuestRoomScan |
 |-|----------|---------------|
 | **Mesh extraction** | CPU marching cubes from GPU volume | Fully GPU-driven Surface Nets via compute shaders — zero CPU readback, single indirect draw call |
-| **Texturing** | Geometry only — no camera RGB texturing | Full camera-based texturing at three resolution tiers: keyframe projection (pixel-level), triplanar world-space cache (~8mm/texel), and vertex colors (~5cm) — all sourced from passthrough camera RGB |
-| **Persistence** | None — mesh lost on restart | Save/load of TSDF + color volumes + triplanar textures to disk |
+| **Texturing** | Geometry only — no camera RGB texturing | Camera-based texturing: triplanar world-space cache (~8mm/texel) and vertex colors (~5cm) — sourced from passthrough camera RGB |
+| **Persistence** | None — mesh lost on restart | Save/load of TSDF + color volumes + triplanar textures to disk, auto-save on quit |
 | **Mesh quality** | Basic TSDF blending | Quality² modulation, confidence-gated Surface Nets, warmup clearing, pruning, body exclusion zones, GPU temporal stabilization, RANSAC plane detection & snapping |
 | **Gaussian Splatting** | — | Full pipeline: on-device capture → PC server training → on-device UGS rendering with render mode switching |
 | **VR UI** | — | World-space debug menu with controller ray interaction, live status, and training controls |

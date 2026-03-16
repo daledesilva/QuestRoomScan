@@ -46,7 +46,7 @@ Add to your project's `Packages/manifest.json`:
 {
   "dependencies": {
     "com.genesis.roomscan": "https://github.com/arghyasur1991/QuestRoomScan.git",
-    "org.nesnausk.gaussian-splatting": "https://github.com/arghyasur1991/UnityGaussianSplatting.git?path=package#feature/runtime-ply-loading"
+    "org.nesnausk.gaussian-splatting": "https://github.com/arghyasur1991/UnityGaussianSplatting.git?path=package#main"
   }
 }
 ```
@@ -112,7 +112,7 @@ cd gs-server/web && npm run dev  # Dashboard at http://localhost:5173
 ```
 
 The flow:
-1. **Upload**: Quest sends a ZIP of keyframes + point cloud to the server
+1. **Upload**: Quest sends a ZIP of keyframes + point cloud to the server (with configurable training iterations via `GSplatServerClient.trainingIterations`)
 2. **Convert**: Server converts Unity poses + intrinsics to COLMAP binary format, computes scene normalization parameters
 3. **Train**: Gaussian Splat training via msplat (Metal), gsplat (CUDA), or 3DGS
 4. **Denormalize**: Output PLY is transformed back to world coordinates (reverses nerfstudio-style scene normalization)
@@ -121,11 +121,12 @@ The flow:
 
 ### On-Device Rendering (UGS)
 
-Trained splats are rendered using a [fork of Unity Gaussian Splatting](https://github.com/arghyasur1991/UnityGaussianSplatting/tree/feature/runtime-ply-loading) with added runtime PLY loading:
+Trained splats are rendered using a [fork of Unity Gaussian Splatting](https://github.com/arghyasur1991/UnityGaussianSplatting) with added runtime PLY loading:
 
 - **`GaussianSplatPlyLoader`**: Parses binary PLY → converts to UGS VeryHigh (Float32) format → creates GPU buffers directly (no Editor asset pipeline needed)
 - **`GaussianSplatRenderer.SetRuntimeSplatData()`**: Accepts pre-built GPU buffer data, bypassing TextAsset/ScriptableObject requirements
 - **Coordinate conversion**: COLMAP (right-handed Y-down) → Unity (left-handed Y-up)
+- **Quest 3 stereo**: Per-eye matrices for correct VR covariance projection, shared covariance/SH between eyes, max splat count limiter, `clip()` over `discard` for Adreno TBDR
 - **Render mode switching**: Mesh, Splat, or Both — toggled via debug menu or controller binding without releasing GPU resources
 
 ### Debug Menu

@@ -418,7 +418,7 @@ Exports GPU mesh vertices as binary PLY to `GSExport/points3d.ply`:
 
 ### 12.3 Server Training (RoomScan-GaussianSplatServer)
 
-The Quest app's `GSplatServerClient` uploads a ZIP of keyframes + point cloud to a PC-based FastAPI server (`/upload`), then polls for status and downloads the result.
+The Quest app's `GSplatServerClient` uploads a ZIP of keyframes + point cloud to a PC-based FastAPI server (`/upload?iterations=N`), then polls for status and downloads the result. Training iterations are configurable via the inspector (`trainingIterations`, default 7000).
 
 #### COLMAP Conversion
 `frames.jsonl` → COLMAP binary format (`cameras.bin`, `images.bin`, `points3D.bin`):
@@ -433,7 +433,7 @@ Computed during COLMAP conversion and saved to `scene_norm.json`:
 - Required because training backends (msplat/nerfstudio) internally normalize the scene but don't expose the parameters
 
 #### Training
-Auto-detects best backend — msplat (Metal), gsplat (CUDA), or original 3DGS repo. Default 7,000 iterations.
+Auto-detects best backend — msplat (Metal), gsplat (CUDA), or original 3DGS repo. Default 7,000 iterations (configurable via `GSplatServerClient.trainingIterations`).
 
 #### Denormalization
 After training, `denormalize_ply()` reverses the scene normalization on the output `splat.ply`:
@@ -447,7 +447,7 @@ Each upload creates a timestamped directory. A `current_run` symlink points to t
 
 ### 12.4 On-Device Rendering (UGS)
 
-Trained PLY is rendered using a [fork of Unity Gaussian Splatting](https://github.com/arghyasur1991/UnityGaussianSplatting/tree/feature/runtime-ply-loading) with runtime loading support.
+Trained PLY is rendered using a [fork of Unity Gaussian Splatting](https://github.com/arghyasur1991/UnityGaussianSplatting) with runtime loading support.
 
 #### Runtime PLY Loading (`GaussianSplatPlyLoader`)
 Parses binary little-endian PLY and converts to UGS internal format (VeryHigh / Float32):
@@ -474,6 +474,13 @@ Accepts pre-built `NativeArray<byte>` buffers and directly creates GPU resources
 - `Texture2D` for Morton-ordered color data
 - Stores format metadata (`VectorFormat.Float32`, `SHFormat.Float32`, `ColorFormat.Float32x4`)
 - No dependency on `GaussianSplatAsset`, `TextAsset`, or `ScriptableObject`
+
+#### Quest 3 Stereo Rendering Optimizations
+The UGS fork includes several Quest 3-specific optimizations:
+- **Per-eye stereo matrices**: Explicit per-eye model-view and projection matrices passed to the compute shader for correct covariance projection in VR (avoids artifacts from using mono matrices)
+- **Shared covariance/SH**: Covariance, SH evaluation, and color are computed once for the left eye and reused for the right eye — only the clip position is recomputed
+- **Max splat count**: Configurable limit (`m_MaxSplatCount`) to cap rendered splats after sorting, useful for mobile perf tuning
+- **Fragment shader**: Uses `clip()` instead of `discard` for better Adreno TBDR performance
 
 #### Visibility Control
 `GaussianSplatRenderer.renderVisible` boolean — checked in `GatherSplatsForCamera()` — allows toggling rendering without disabling the component or releasing GPU resources. Used by `GSplatManager.RenderVisible` → `RoomScanner.ApplyRenderMode()` for Mesh/Splat/Both switching.

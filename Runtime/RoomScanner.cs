@@ -208,6 +208,13 @@ namespace Genesis.RoomScan
                 _clearDoneCallback = null;
             }
 
+            if (_reinitExportPending)
+            {
+                _reinitExportPending = false;
+                if (_keyframeCollector != null)
+                    _keyframeCollector.ReinitExportDir();
+            }
+
             if (!IsScanning || !DepthCapture.DepthAvailable) return;
 
             float t = Time.time;
@@ -250,7 +257,26 @@ namespace Genesis.RoomScan
             IsScanning = true;
 
             if (_keyframeCollector != null)
-                _keyframeCollector.ClearExport();
+            {
+                _keyframeCollector.ClearInMemory();
+                string gsExportDir = Path.Combine(Application.persistentDataPath, "GSExport");
+                System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try
+                    {
+                        if (Directory.Exists(gsExportDir))
+                            Directory.Delete(gsExportDir, true);
+                    }
+                    catch (Exception e)
+                    {
+                        Debug.LogError($"[RoomScan] StartScanning clear error: {e.Message}");
+                    }
+                    finally
+                    {
+                        _reinitExportPending = true;
+                    }
+                });
+            }
 
             float t = Time.time;
             _lastIntegrationTime = t;
@@ -349,6 +375,7 @@ namespace Genesis.RoomScan
 
         private volatile bool _clearInProgress;
         private volatile bool _clearDone;
+        private volatile bool _reinitExportPending;
         private Action _clearDoneCallback;
 
         public void SetRenderMode(ScanRenderMode newMode)

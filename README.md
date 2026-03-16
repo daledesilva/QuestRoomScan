@@ -73,6 +73,53 @@ Or clone locally and reference as local packages:
 3. Build and deploy to Quest 3
 4. The room mesh appears as you look around — surfaces solidify with repeated observations
 
+## Usage Flow
+
+### Scanning
+
+Scanning starts automatically on launch (configurable via `autoStartOnLoad`). As you look around:
+
+1. **Depth integration**: Each depth frame is fused into the TSDF volume with color from the passthrough camera
+2. **Mesh extraction**: GPU Surface Nets extracts a mesh from the volume every few frames (after a minimum number of integrations)
+3. **Texturing**: Camera RGB is baked into triplanar world-space textures for persistent surface color
+4. **Keyframe capture**: Motion-gated JPEG snapshots + camera poses are saved to `GSExport/` on disk — these are used later for Gaussian Splat training
+5. **Point cloud export**: GPU mesh vertices are auto-exported as `points3d.ply` every 30 seconds (configurable)
+
+**Tips for a good scan**: Move slowly around the room. Look at surfaces from multiple angles — repeated observations from different viewpoints improve mesh quality. Make sure to cover walls, floor, ceiling, and furniture from several directions before training.
+
+### Freeze / Unfreeze
+
+When a region of the mesh looks good and you don't want further integration to degrade it:
+
+- **Freeze In View** (Y/B button): Locks all voxels currently in your camera frustum. Frozen voxels are skipped during integration — their geometry and color are preserved exactly as-is.
+- **Unfreeze In View** (X/A button): Restores frozen voxels in your current frustum to normal integration.
+
+This lets you selectively protect good surfaces while continuing to refine other areas.
+
+### Training Gaussian Splats
+
+Once the room is well-scanned:
+
+1. Open the debug menu (left thumbstick click)
+2. Verify the **Server URL** points to your PC running [RoomScan-GaussianSplatServer](https://github.com/arghyasur1991/RoomScan-GaussianSplatServer) (default: `http://192.168.1.100:8420`)
+3. Press **Start GS Training** — this triggers the full pipeline automatically:
+   - Exports the current mesh as a point cloud (`points3d.ply`)
+   - ZIPs all keyframes, poses, and point cloud from `GSExport/`
+   - Uploads the ZIP to the server
+   - The debug menu shows live training status: state, progress bar, iteration count, elapsed time, backend
+   - When training completes, the trained PLY is downloaded back to the Quest
+4. Press **Render Mode** to cycle to Splat view — the downloaded PLY is loaded into `GaussianSplatRenderer` and rendered on-device
+5. Cycle through Mesh → Splat → Both → Mesh to compare views
+
+Scanning continues during training — you can keep refining the mesh while waiting.
+
+### Saving and Loading
+
+- **Save Scan**: Persists the full TSDF + color volumes and triplanar textures to disk (`RoomScans/scan.bin` + `RoomScans/triplanar/`)
+- **Load Scan**: Restores a previously saved scan, rebuilds the mesh. Validates that volume dimensions match.
+- **Auto-save on quit**: If enabled (default), the scan is automatically saved when the app exits
+- **Clear All Data**: Stops scanning, clears volumes/mesh/triplanar/keyframes, deletes saved scan and GSExport from disk
+
 ### Architecture
 
 ```
@@ -102,12 +149,12 @@ See [ALGORITHM.md](ALGORITHM.md) for the full technical reference.
 
 ## Gaussian Splat Pipeline
 
-QuestRoomScan captures keyframes and a dense point cloud during scanning, uploads them to a PC training server, and renders the trained Gaussian splats on-device.
+QuestRoomScan captures keyframes and a dense point cloud during scanning, uploads them to a PC training server, and renders the trained Gaussian splats on-device. See [Usage Flow > Training Gaussian Splats](#training-gaussian-splats) for the step-by-step user guide.
 
-### On-Device (automatic capture)
+### On-Device Capture (automatic during scanning)
 
-- **KeyframeCollector**: Motion-gated JPEG frames + camera poses saved to `GSExport/` on disk (`images/*.jpg`, `frames.jsonl`)
-- **PointCloudExporter**: GPU mesh vertices exported as binary PLY (`points3d.ply`) via `AsyncGPUReadback`
+- **KeyframeCollector**: Motion-gated JPEG frames + camera poses saved to `GSExport/` on disk (`images/*.jpg`, `frames.jsonl`). Captures are triggered by camera movement — you get more keyframes by looking at the room from different angles.
+- **PointCloudExporter**: GPU mesh vertices exported as binary PLY (`points3d.ply`) via `AsyncGPUReadback`. Auto-exports every 30 seconds during scanning, or manually via the debug menu.
 
 ### Server Training (via [RoomScan-GaussianSplatServer](https://github.com/arghyasur1991/RoomScan-GaussianSplatServer))
 
@@ -118,13 +165,15 @@ python main.py --port 8420  # API server
 npm run dev                  # Dashboard at http://localhost:5173
 ```
 
-The flow:
-1. **Export**: Point cloud exported from GPU mesh; keyframes already on disk from scanning
-2. **Upload**: Quest ZIPs `GSExport/` contents (`frames.jsonl`, `points3d.ply`, `images/*.jpg`) and POSTs to `{serverUrl}/upload?iterations={N}`
-3. **Train**: Server converts Unity poses + intrinsics to COLMAP binary format, trains via msplat/gsplat/3DGS
-4. **Poll**: Quest polls `{serverUrl}/api/status` every ~3s — debug menu shows state, progress, iteration, elapsed, backend
-5. **Download**: Quest GETs `{serverUrl}/download` → trained PLY bytes
-6. **Render**: `GSplatManager` loads PLY via `GaussianSplatPlyLoader.LoadFromPlyBytes()` → `GaussianSplatRenderer` renders on-device
+When you press **Start GS Training** in the debug menu, the following happens automatically:
+
+1. **Export**: Final point cloud exported from GPU mesh
+2. **ZIP & Upload**: Quest packages `GSExport/` contents (`frames.jsonl`, `points3d.ply`, `images/*.jpg`) into a ZIP and POSTs to `{serverUrl}/upload?iterations={N}`
+3. **Convert**: Server converts Unity poses + intrinsics to COLMAP binary format, computes scene normalization
+4. **Train**: Gaussian Splat training via msplat (Metal), gsplat (CUDA), or 3DGS — the debug menu shows live progress
+5. **Denormalize**: Output PLY is transformed back to world coordinates (reverses nerfstudio-style scene normalization)
+6. **Download**: Quest GETs `{serverUrl}/download` → trained PLY bytes stored in memory
+7. **View**: Press **Render Mode** to cycle to Splat — `GSplatManager` loads PLY via `GaussianSplatPlyLoader.LoadFromPlyBytes()` and renders on-device
 
 ### On-Device Rendering (UGS)
 
@@ -146,17 +195,48 @@ Trained splats are rendered using a [fork of Unity Gaussian Splatting](https://g
 
 ## VR Debug Menu
 
-World-space UI Toolkit panel activated via **left thumbstick click** (Quest OS reserves the Menu/Start button for system use). Uses controller ray interaction with trigger to click.
+World-space UI Toolkit panel activated via **left thumbstick click** (Quest OS reserves the Menu/Start button for system use). Point the controller ray at buttons and press the **index trigger** to click.
 
-**Lazy-follow**: Panel floats at 0.75m, re-centers when gaze drifts past 45 degrees.
+The panel lazy-follows your gaze — it floats at 0.75m and re-centers when your head drifts past 45 degrees.
 
-| Section | Contents |
-|---------|----------|
-| **Scan Status** | Scanning state, render mode, integration count, keyframe count, render info |
-| **Server Training** | Editable server URL, training state, progress bar, iteration count, elapsed time, backend name, status message |
-| **Persistence** | Saved scan info, GSExport directory status |
-| **Actions** | Toggle Scan, Cycle Render Mode, Save Scan, Load Scan, Export Point Cloud, Start GS Training, Cancel Training, Clear All Data |
-| **Footer** | Live FPS counter |
+![Debug Menu](Documentation~/debug-menu.png)
+
+### Sections
+
+**Scan Status** — Live readouts updated every frame:
+- **Scanning**: Whether integration is active (Running / Stopped)
+- **Mode**: Current scanning mode
+- **Integrations**: Total depth frames integrated into the volume
+- **Keyframes**: Number of motion-gated JPEG snapshots captured for GS training
+- **Render**: Current render mode (Mesh / Splat / Both)
+
+**Server Training** — Gaussian Splat training status:
+- **Server**: Editable URL field pointing to your PC server (e.g. `http://192.168.1.100:8420`)
+- **State**: Idle, Uploading, Training, Downloading, Done, Error
+- **Progress**: Visual progress bar
+- **Iteration**: Current / total training iterations
+- **Elapsed**: Training wall-clock time
+- **Backend**: Which training backend the server is using (msplat / gsplat / 3DGS)
+- **Message**: Status messages from the server
+
+**Persistence** — Data on disk:
+- **Saved Scan**: Whether a saved scan exists (with size)
+- **GSExport**: Whether keyframes/point cloud are on disk (with count)
+
+### Action Buttons
+
+| Button | What it does |
+|--------|-------------|
+| **Stop/Start Scanning** | Toggles depth integration, keyframe capture, and triplanar baking. Label updates to reflect current state. |
+| **Render: Mesh** | Cycles render mode: Mesh → Splat → Both → Mesh. If a trained PLY has been downloaded but not yet loaded, switching to Splat auto-loads it. Label shows current mode. |
+| **Save Scan** | Persists TSDF + color volumes and triplanar textures to disk. Button shows "Saving..." then "Done!" or "Failed". |
+| **Load Scan** | Restores a previously saved scan and rebuilds the mesh. Validates volume dimensions match. |
+| **Export Point Cloud** | Manually exports GPU mesh vertices as `points3d.ply` via async readback (also auto-exports every 30s during scanning). |
+| **Start GS Training** | Triggers the full training pipeline: export point cloud → ZIP keyframes → upload → train → download. Disabled while training is in progress. |
+| **Cancel Training** | Sends cancel request to the server. Only enabled while training is in progress. |
+| **Clear All Data** | Stops scanning, clears all volumes/mesh/textures, deletes saved scan and GSExport from disk. |
+
+**Footer**: Live FPS counter.
 
 ### Default Controller Bindings
 
@@ -168,7 +248,7 @@ World-space UI Toolkit panel activated via **left thumbstick click** (Quest OS r
 | Three (A/X) | Cycle Render Mode |
 | Four (B/Y) | Start Server Training (disabled by default) |
 
-Bindings are fully configurable via `RoomScanInputHandler` — add, remove, or remap any `ScanAction` to any `OVRInput.Button`.
+All bindings are configurable via `RoomScanInputHandler` — add, remove, or remap any `ScanAction` to any `OVRInput.Button`.
 
 ## Memory Budget (Quest 3)
 

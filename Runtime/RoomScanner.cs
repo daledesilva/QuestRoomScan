@@ -249,6 +249,9 @@ namespace Genesis.RoomScan
             if (IsScanning) return;
             IsScanning = true;
 
+            if (_keyframeCollector != null)
+                _keyframeCollector.ClearExport();
+
             float t = Time.time;
             _lastIntegrationTime = t;
             _lastMeshTime = t;

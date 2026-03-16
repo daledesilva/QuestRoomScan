@@ -101,7 +101,7 @@ This lets you selectively protect good surfaces while continuing to refine other
 Once the room is well-scanned:
 
 1. Open the debug menu (left thumbstick click)
-2. Verify the **Server URL** points to your PC running [RoomScan-GaussianSplatServer](https://github.com/arghyasur1991/RoomScan-GaussianSplatServer) (default: `http://192.168.1.100:8420`)
+2. Verify the **Server URL** points to your PC running [RoomScan-GaussianSplatServer](https://github.com/arghyasur1991/RoomScan-GaussianSplatServer). If you used the setup wizard and your PC is on the same LAN, the IP is auto-detected and should already be correct. For a cloud/remote server, edit the URL in the debug menu or set it in the Inspector before building.
 3. Press **Start GS Training** — this triggers the full pipeline automatically:
    - Exports the current mesh as a point cloud (`points3d.ply`)
    - ZIPs all keyframes, poses, and point cloud from `GSExport/`
@@ -199,7 +199,7 @@ World-space UI Toolkit panel activated via **left thumbstick click** (Quest OS r
 
 The panel lazy-follows your gaze — it floats at 0.75m and re-centers when your head drifts past 45 degrees.
 
-![Debug Menu](Documentation~/debug-menu.png)
+![Debug Menu](docs/debug-menu.png)
 
 ### Sections
 

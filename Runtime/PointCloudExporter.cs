@@ -23,6 +23,15 @@ namespace Genesis.RoomScan
 
         public string ExportPath => _plyPath;
 
+        /// <summary>
+        /// Resets the auto-export timer so a fresh PLY is written promptly
+        /// after the export directory is recreated.
+        /// </summary>
+        public void ResetTimer()
+        {
+            _lastExportTime = 0f;
+        }
+
         private void Start()
         {
             _exportDir = Path.Combine(Application.persistentDataPath, "GSExport");

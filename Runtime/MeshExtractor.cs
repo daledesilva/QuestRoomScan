@@ -39,7 +39,7 @@ namespace Genesis.RoomScan
         [Header("Compute")]
         [SerializeField] public ComputeShader surfaceNetsCompute;
         [SerializeField, Tooltip("Max vertex fraction of total voxels (0.01-0.10).")]
-        [Range(0.01f, 0.10f)] private float gpuVertexBudgetPercent = 0.05f;
+        [Range(0.01f, 0.10f)] private float gpuVertexBudgetPercent = 0.08f;
 
         private GPUSurfaceNets _gpuSurfaceNets;
         private GPUMeshRenderer _gpuRenderer;

@@ -16,16 +16,19 @@ namespace Genesis.RoomScan
     public class KeyframeCollector : MonoBehaviour
     {
         [SerializeField, Tooltip("Min translation (m) from any saved keyframe to trigger a new capture")]
-        private float moveThreshold = 0.3f;
+        private float moveThreshold = 0.15f;
 
         [SerializeField, Tooltip("Min rotation (deg) from any saved keyframe to trigger a new capture")]
-        private float rotateThresholdDeg = 20f;
+        private float rotateThresholdDeg = 10f;
 
         [SerializeField, Range(50, 100)]
-        private int jpegQuality = 90;
+        private int jpegQuality = 95;
 
         [SerializeField, Tooltip("Max angular velocity (deg/s) to accept a frame (rejects motion blur)")]
         private float maxAngularVelocity = 120f;
+
+        [SerializeField, Tooltip("Min seconds between captures to prevent burst saves")]
+        private float minCaptureInterval = 0.25f;
 
         private string _exportDir;
         private string _imagesDir;
@@ -37,6 +40,7 @@ namespace Genesis.RoomScan
         private int _pendingWrites;
         private Quaternion _prevRot;
         private float _prevRotTime;
+        private float _lastCaptureTime;
         private bool _initialized;
 
         public int SavedCount => _nextId;
@@ -66,6 +70,8 @@ namespace Genesis.RoomScan
         {
             if (!_initialized || frame == null) return;
 
+            if (Time.time - _lastCaptureTime < minCaptureInterval) return;
+
             float dt = Time.time - _prevRotTime;
             if (dt > 0.001f)
             {
@@ -80,6 +86,7 @@ namespace Genesis.RoomScan
             int id = _nextId++;
             _savedPositions.Add(pos);
             _savedRotations.Add(rot);
+            _lastCaptureTime = Time.time;
 
             float timestamp = Time.realtimeSinceStartup;
 

@@ -53,6 +53,7 @@ namespace Genesis.RoomScan.Editor
         bool _depthCaptureWired, _volumeWired, _meshMatWired, _triplanarWired, _computeShaderWired;
         bool _ugsRendererWired;
         bool _ugsRenderFeatureAdded;
+        bool _deferredRendering;
         bool _boundarylessManifest;
         bool _cleartextAllowed;
         bool _insecureHttpAllowed;
@@ -144,6 +145,7 @@ namespace Genesis.RoomScan.Editor
             _ugsRendererWired = _ugsRenderer != null && AreFieldsAssigned(_ugsRenderer,
                 "m_ShaderSplats", "m_ShaderComposite", "m_ShaderDebugPoints", "m_ShaderDebugBoxes", "m_CSSplatUtilities");
             _ugsRenderFeatureAdded = HasUGSRenderFeature();
+            _deferredRendering = IsDeferredRendering();
 
             _boundarylessManifest = ManifestHasBoundaryless();
             _cleartextAllowed = ManifestHasCleartextTraffic();
@@ -679,11 +681,13 @@ namespace Genesis.RoomScan.Editor
             StatusRow("SurfaceNetsExtract compute shader", _computeShaderWired);
             StatusRow("UGS renderer shaders + compute", _ugsRendererWired);
             StatusRow("UGS RenderFeature on URP Renderer", _ugsRenderFeatureAdded);
+            StatusRow("URP Deferred Rendering (req. by UGS)", _deferredRendering);
 
             bool needsFix = !_depthCaptureWired || !_volumeWired ||
                             !_meshMatWired || !_triplanarWired ||
                             !_computeShaderWired ||
-                            !_ugsRendererWired || !_ugsRenderFeatureAdded;
+                            !_ugsRendererWired || !_ugsRenderFeatureAdded ||
+                            !_deferredRendering;
             if (needsFix)
             {
                 GUILayout.Space(2);
@@ -768,6 +772,9 @@ namespace Genesis.RoomScan.Editor
 
             if (!_ugsRenderFeatureAdded)
                 AddUGSRenderFeature();
+
+            if (!_deferredRendering)
+                SetDeferredRendering();
 
             MarkDirty();
             Refresh();
@@ -866,6 +873,40 @@ namespace Genesis.RoomScan.Editor
                 if (f != null && f.GetType().Name == "GaussianSplatURPFeature") return true;
             }
             return false;
+        }
+
+        const int RENDERING_MODE_DEFERRED = 1;
+
+        static bool IsDeferredRendering()
+        {
+            var rd = FindActiveRendererData();
+            if (rd == null) return false;
+            var so = new SerializedObject(rd);
+            var prop = so.FindProperty("m_RenderingMode");
+            return prop != null && prop.intValue == RENDERING_MODE_DEFERRED;
+        }
+
+        static void SetDeferredRendering()
+        {
+            var rd = FindActiveRendererData();
+            if (rd == null)
+            {
+                Debug.LogWarning("[RoomScan Setup] No active URP RendererData found");
+                return;
+            }
+
+            var so = new SerializedObject(rd);
+            var prop = so.FindProperty("m_RenderingMode");
+            if (prop == null) return;
+
+            if (prop.intValue != RENDERING_MODE_DEFERRED)
+            {
+                prop.intValue = RENDERING_MODE_DEFERRED;
+                so.ApplyModifiedProperties();
+                EditorUtility.SetDirty(rd);
+                AssetDatabase.SaveAssets();
+                Debug.Log("[RoomScan Setup] Switched URP Renderer to Deferred rendering (required by UGS)");
+            }
         }
 
         static void AddUGSRenderFeature()

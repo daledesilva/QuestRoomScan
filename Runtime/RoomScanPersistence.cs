@@ -207,7 +207,13 @@ namespace Genesis.RoomScan
                 }
 
                 if (cm != null)
+                {
                     cm.Reinitialize();
+                    // Scanner only calls Extract() while IsScanning; after load, volumes are
+                    // restored but GPU mesh buffers stay empty until we extract once here.
+                    cm.Extract();
+                    Debug.Log("[RoomScan] Persistence: mesh extracted from loaded volume");
+                }
 
                 Debug.Log($"[RoomScan] Persistence: loaded scan (integrations={savedIntCount})");
                 LoadCompleted?.Invoke();

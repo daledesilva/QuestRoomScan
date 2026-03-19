@@ -218,7 +218,8 @@ namespace Genesis.RoomScan
 
         public static byte[] ReadRTBytes(RenderTexture rt)
         {
-            var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false);
+            // linear=true: bytes match UNorm RT / LoadRaw round-trip (sRGB Texture2D darkens on Blit).
+            var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false, true);
             var prev = RenderTexture.active;
             RenderTexture.active = rt;
             tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
@@ -264,9 +265,9 @@ namespace Genesis.RoomScan
                 return;
             }
 
-            var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false);
+            var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false, true);
             tex.LoadRawTextureData(data);
-            tex.Apply();
+            tex.Apply(false, false);
             Graphics.Blit(tex, rt);
             Destroy(tex);
         }

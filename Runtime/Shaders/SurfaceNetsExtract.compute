@@ -202,7 +202,9 @@ void ClassifyAndEmit(uint3 id : SV_DispatchThreadID)
     float3 norm     = normalize(gradDir);
 
     float4 col = _ColorVolume[(int3)id];
-    uint packed = (col.a > 0.04) ? PackColor(col) : PackColor(float4(0.078, 0.078, 0.098, 1.0));
+    // Threshold must stay below ~2/255: after save/load, coverage alpha is quantized to 8-bit
+    // and can dip slightly below 0.04 even when rgb is valid — old cutoff forced dark gray verts.
+    uint packed = (col.a > 0.008) ? PackColor(col) : PackColor(float4(0.078, 0.078, 0.098, 1.0));
 
     uint compactIdx;
     InterlockedAdd(_Counters[0], 1, compactIdx);

@@ -256,6 +256,14 @@ namespace Genesis.RoomScan
         {
             if (!File.Exists(path)) return;
             byte[] data = File.ReadAllBytes(path);
+            int expected = rt.width * rt.height * 4;
+            if (data.Length != expected)
+            {
+                Debug.LogWarning($"[RoomScan] Triplanar {path}: size {data.Length} != expected {expected} " +
+                    $"(RT {rt.width}x{rt.height}). Skipping plane.");
+                return;
+            }
+
             var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false);
             tex.LoadRawTextureData(data);
             tex.Apply();

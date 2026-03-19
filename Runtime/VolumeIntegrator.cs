@@ -119,12 +119,13 @@ namespace Genesis.RoomScan
         private void Awake()
         {
             Instance = this;
+            // Create GPU volumes in Awake so RoomScanPersistence.LoadAsync and other
+            // early callers never see Volume == null (Start order is not guaranteed).
+            CreateVolume();
         }
 
         private void Start()
         {
-            CreateVolume();
-
             _clearKernel = new ComputeKernelHelper(compute, "Clear");
             _clearKernel.Set(VolumeRWID, _volume);
             _clearKernel.Set(ColorVolumeRWID, _colorVolume);
@@ -424,12 +425,17 @@ namespace Genesis.RoomScan
             Integrated?.Invoke();
         }
 
-        public void LoadVolumes(byte[] tsdfBytes, byte[] colorBytes, int integrationCount)
+        /// <summary>
+        /// Uploads CPU TSDF/color blobs into the 3D RenderTextures.
+        /// Uses <see cref="GraphicsFormat"/> matching the volume RTs so
+        /// <see cref="Graphics.CopyTexture"/> is valid on Metal/Vulkan (RG16 Texture3D ≠ R8G8_SNorm layout).
+        /// </summary>
+        public bool LoadVolumes(byte[] tsdfBytes, byte[] colorBytes, int integrationCount)
         {
             if (_volume == null || _colorVolume == null)
             {
                 Debug.LogError("[RoomScan] Cannot load volumes: textures not created");
-                return;
+                return false;
             }
 
             int3 s = voxelCount;
@@ -439,21 +445,22 @@ namespace Genesis.RoomScan
             if (tsdfBytes.Length != expectedTsdf)
             {
                 Debug.LogError($"[RoomScan] TSDF size mismatch: got {tsdfBytes.Length}, expected {expectedTsdf}");
-                return;
+                return false;
             }
             if (colorBytes.Length != expectedColor)
             {
                 Debug.LogError($"[RoomScan] Color volume size mismatch: got {colorBytes.Length}, expected {expectedColor}");
-                return;
+                return false;
             }
 
-            var tsdfTex = new Texture3D(s.x, s.y, s.z, TextureFormat.RG16, false);
+            // Must match CreateVolume(): R8G8_SNorm TSDF + RGBA8_UNorm color
+            var tsdfTex = new Texture3D(s.x, s.y, s.z, GraphicsFormat.R8G8_SNorm, TextureCreationFlags.None);
             tsdfTex.SetPixelData(tsdfBytes, 0);
             tsdfTex.Apply(false, false);
             Graphics.CopyTexture(tsdfTex, _volume);
             Destroy(tsdfTex);
 
-            var colorTex = new Texture3D(s.x, s.y, s.z, TextureFormat.RGBA32, false);
+            var colorTex = new Texture3D(s.x, s.y, s.z, GraphicsFormat.R8G8B8A8_UNorm, TextureCreationFlags.None);
             colorTex.SetPixelData(colorBytes, 0);
             colorTex.Apply(false, false);
             Graphics.CopyTexture(colorTex, _colorVolume);
@@ -463,6 +470,7 @@ namespace Genesis.RoomScan
             _frustumReady = false;
 
             Debug.Log($"[RoomScan] Volumes loaded: {s}, integrationCount={integrationCount}");
+            return true;
         }
 
         public float3 VoxelToWorld(uint3 indices)

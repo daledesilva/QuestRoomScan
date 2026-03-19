@@ -157,6 +157,9 @@ namespace Genesis.RoomScan
                     out savedVoxCount, out savedVoxSize, out savedIntCount,
                     out tsdfBytes, out colorBytes, out triRes));
 
+                // File I/O ran on a pool thread; ensure GPU/upload code runs on the main thread (Quest/IL2CPP).
+                await Awaitable.MainThreadAsync();
+
                 int3 currentVox = vi.VoxelCount;
                 if (math.any(savedVoxCount != currentVox))
                 {
@@ -173,11 +176,21 @@ namespace Genesis.RoomScan
                     return false;
                 }
 
-                vi.LoadVolumes(tsdfBytes, colorBytes, savedIntCount);
+                if (!vi.LoadVolumes(tsdfBytes, colorBytes, savedIntCount))
+                    return false;
 
                 var tc = TriplanarCache.Instance;
                 if (tc != null && triRes > 0 && Directory.Exists(TriplanarDirectory))
-                    tc.Load(TriplanarDirectory);
+                {
+                    try
+                    {
+                        tc.Load(TriplanarDirectory);
+                    }
+                    catch (Exception e)
+                    {
+                        Debug.LogWarning($"[RoomScan] Persistence: triplanar load skipped ({e.Message})");
+                    }
+                }
 
                 if (cm != null)
                     cm.Reinitialize();

@@ -146,6 +146,11 @@ namespace Genesis.RoomScan
             IsLoading = true;
             try
             {
+                // Capture paths on main thread — SaveFilePath/TriplanarDirectory use
+                // Application.persistentDataPath; must not run inside Task.Run (Android/IL2CPP).
+                string saveFilePath = SaveFilePath;
+                string triplanarDir = TriplanarDirectory;
+
                 byte[] tsdfBytes = null;
                 byte[] colorBytes = null;
                 int3 savedVoxCount = default;
@@ -153,7 +158,7 @@ namespace Genesis.RoomScan
                 int savedIntCount = 0;
                 int triRes = 0;
 
-                await Task.Run(() => ReadBinary(SaveFilePath,
+                await Task.Run(() => ReadBinary(saveFilePath,
                     out savedVoxCount, out savedVoxSize, out savedIntCount,
                     out tsdfBytes, out colorBytes, out triRes));
 
@@ -180,11 +185,11 @@ namespace Genesis.RoomScan
                     return false;
 
                 var tc = TriplanarCache.Instance;
-                if (tc != null && triRes > 0 && Directory.Exists(TriplanarDirectory))
+                if (tc != null && triRes > 0 && Directory.Exists(triplanarDir))
                 {
                     try
                     {
-                        tc.Load(TriplanarDirectory);
+                        tc.Load(triplanarDir);
                     }
                     catch (Exception e)
                     {

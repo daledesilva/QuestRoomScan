@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using Genesis.RoomScan.GSplat;
 using Genesis.RoomScan.UI;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 namespace Genesis.RoomScan
 {
@@ -44,7 +45,12 @@ namespace Genesis.RoomScan
         [Header("Scan Settings")]
         [SerializeField] private ScanMode mode = ScanMode.Passive;
         [SerializeField] private ScanVisualization visualization = ScanVisualization.VertexColored;
-        [SerializeField] private bool autoStartOnLoad = true;
+
+        [SerializeField, FormerlySerializedAs("autoStartOnLoad"), Tooltip(
+            "When enabled, depth/color integration starts as soon as the scene loads. " +
+            "When disabled (default), scanning stays paused until you tap Start Scanning in the debug menu — " +
+            "avoids overwriting a restored scan and makes Load Scan easier to test.")]
+        private bool startScanningAutomatically = false;
 
         [Header("Passive Mode Rates")]
         [SerializeField] private float passiveIntegrationHz = 30f;
@@ -161,16 +167,18 @@ namespace Genesis.RoomScan
 
         private void OnRoomReady()
         {
-            if (autoStartOnLoad)
+            if (startScanningAutomatically)
                 StartScanning();
 
             _started = true;
-            Debug.Log("[RoomScan] Room ready, scanning started");
+            Debug.Log(startScanningAutomatically
+                ? "[RoomScan] Room ready, scanning started automatically"
+                : "[RoomScan] Room ready, scanning paused — use debug menu Start Scanning");
         }
 
         private void OnEnable()
         {
-            if (_started && autoStartOnLoad && !IsScanning)
+            if (_started && startScanningAutomatically && !IsScanning)
                 StartScanning();
         }
 
@@ -202,7 +210,7 @@ namespace Genesis.RoomScan
                 if (_keyframeCollector != null)
                     _keyframeCollector.ReinitExportDir();
                 Debug.Log("[RoomScan] All scan + export data cleared");
-                if (autoStartOnLoad)
+                if (startScanningAutomatically)
                     StartScanning();
                 _clearDoneCallback?.Invoke();
                 _clearDoneCallback = null;

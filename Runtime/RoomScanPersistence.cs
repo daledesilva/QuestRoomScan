@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using Unity.Mathematics;
 using UnityEngine;
@@ -146,6 +147,11 @@ namespace Genesis.RoomScan
             IsLoading = true;
             try
             {
+                // Capture Unity's sync context on entry (UI / main thread). After Task.Run, continuations
+                // can run on the thread pool on some IL2CPP builds. Do not use Awaitable.MainThreadAsync()
+                // inside async Task — it can stall forever on device; marshal with captured context instead.
+                var unitySync = SynchronizationContext.Current;
+
                 // Capture paths on main thread — SaveFilePath/TriplanarDirectory use
                 // Application.persistentDataPath; must not run inside Task.Run (Android/IL2CPP).
                 string saveFilePath = SaveFilePath;
@@ -158,12 +164,14 @@ namespace Genesis.RoomScan
                 int savedIntCount = 0;
                 int triRes = 0;
 
+                Debug.Log("[RoomScan] Persistence: load reading file (background)...");
                 await Task.Run(() => ReadBinary(saveFilePath,
                     out savedVoxCount, out savedVoxSize, out savedIntCount,
                     out tsdfBytes, out colorBytes, out triRes));
+                Debug.Log($"[RoomScan] Persistence: load read done voxels={savedVoxCount}, tsdf={tsdfBytes?.Length ?? 0}, color={colorBytes?.Length ?? 0}");
 
-                // File I/O ran on a pool thread; ensure GPU/upload code runs on the main thread (Quest/IL2CPP).
-                await Awaitable.MainThreadAsync();
+                await SwitchToUnityMainThreadAsync(unitySync);
+                Debug.Log("[RoomScan] Persistence: load continuing on main thread");
 
                 int3 currentVox = vi.VoxelCount;
                 if (math.any(savedVoxCount != currentVox))
@@ -181,6 +189,7 @@ namespace Genesis.RoomScan
                     return false;
                 }
 
+                Debug.Log("[RoomScan] Persistence: uploading volumes to GPU...");
                 if (!vi.LoadVolumes(tsdfBytes, colorBytes, savedIntCount))
                     return false;
 
@@ -290,6 +299,32 @@ namespace Genesis.RoomScan
 
             int colorLen = r.ReadInt32();
             colorBytes = r.ReadBytes(colorLen);
+        }
+
+        /// <summary>
+        /// Returns to the Unity player main thread after <see cref="Task.Run"/> I/O.
+        /// Prefer posting to the <see cref="SynchronizationContext"/> captured while still on the main thread;
+        /// <see cref="Awaitable.MainThreadAsync"/> inside <c>async Task</c> methods has been observed to hang on Quest.
+        /// </summary>
+        private static Task SwitchToUnityMainThreadAsync(SynchronizationContext capturedAtLoadStart)
+        {
+            if (capturedAtLoadStart == null)
+            {
+                Debug.LogWarning("[RoomScan] Persistence: no SynchronizationContext when load started; using MainThreadAsync fallback");
+                return MainThreadAsyncAsTask();
+            }
+
+            if (ReferenceEquals(capturedAtLoadStart, SynchronizationContext.Current))
+                return Task.CompletedTask;
+
+            var tcs = new TaskCompletionSource<bool>();
+            capturedAtLoadStart.Post(_ => tcs.TrySetResult(true), null);
+            return tcs.Task;
+        }
+
+        private static async Task MainThreadAsyncAsTask()
+        {
+            await Awaitable.MainThreadAsync();
         }
     }
 }

@@ -67,12 +67,10 @@ Shader "Genesis/ScanMeshVertexColor"
             float4 gsVoxCount;
             float gsVoxSize;
 
-            float3 WorldToVoxelUVW(float3 pos)
+            float3 WorldToVoxelUVW(float3 worldPos)
             {
-                pos /= gsVoxSize;
-                pos += gsVoxCount.xyz / 2.0;
-                pos /= gsVoxCount.xyz;
-                return saturate(pos);
+                float3 local = worldPos / gsVoxSize + gsVoxCount.xyz / 2.0;
+                return saturate(local / gsVoxCount.xyz);
             }
 
             float2 SignedTriUV(float2 baseUV, float normalComponent)
@@ -82,9 +80,9 @@ Shader "Genesis/ScanMeshVertexColor"
 
             half3 SampleTriplanar(float3 worldPos, float3 normal)
             {
-                float3 absN = abs(normal);
-                float3 blend = absN / (absN.x + absN.y + absN.z + 0.001);
-                float3 uvw = WorldToVoxelUVW(worldPos);
+                float3 absN   = abs(normal);
+                float3 blend  = absN / (absN.x + absN.y + absN.z + 0.001);
+                float3 uvw    = WorldToVoxelUVW(worldPos);
 
                 float2 uvXZ = SignedTriUV(uvw.xz, normal.y);
                 float2 uvXY = SignedTriUV(uvw.xy, normal.z);

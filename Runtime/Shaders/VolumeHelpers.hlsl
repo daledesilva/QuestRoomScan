@@ -19,18 +19,12 @@ float3 gsExclusionHeads[64];
 
 float3 gsVoxelToWorld(uint3 indices)
 {
-    float3 pos = (float3)indices;
-    pos += 0.5;
-    pos -= (float3)gsVoxCount / 2.0;
-    pos *= gsVoxSize;
-    return pos;
+    return ((float3)indices + 0.5 - (float3)gsVoxCount / 2.0) * gsVoxSize;
 }
 
-float3 gsWorldToVoxelFloat(float3 pos)
+float3 gsWorldToVoxelFloat(float3 worldPos)
 {
-    pos /= gsVoxSize;
-    pos += (float3)gsVoxCount / 2.0;
-    return pos;
+    return worldPos / gsVoxSize + (float3)gsVoxCount / 2.0;
 }
 
 uint3 gsWorldToVoxel(float3 pos)

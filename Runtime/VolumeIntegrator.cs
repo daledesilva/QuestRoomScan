@@ -220,6 +220,84 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
+        /// Resample TSDF + color from the current (relocated) grid into a new identity grid.
+        /// After this call the volume data lives in the current tracking/world frame.
+        /// </summary>
+        public void BakeRelocation(Matrix4x4 relocationMatrix)
+        {
+            if (_volume == null || _colorVolume == null || compute == null)
+                return;
+
+            Matrix4x4 invRelocation = relocationMatrix.inverse;
+            int3 vc = voxelCount;
+
+            var dstTsdf = new RenderTexture(vc.x, vc.y, 0, _volume.graphicsFormat, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = vc.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Bilinear,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            dstTsdf.Create();
+
+            var dstColor = new RenderTexture(vc.x, vc.y, 0, _colorVolume.graphicsFormat, 0)
+            {
+                dimension = TextureDimension.Tex3D,
+                volumeDepth = vc.z,
+                enableRandomWrite = true,
+                filterMode = FilterMode.Bilinear,
+                wrapMode = TextureWrapMode.Clamp
+            };
+            dstColor.Create();
+
+            int kernel = compute.FindKernel("BakeRelocation");
+            compute.SetInts(Shader.PropertyToID("gsVoxCount"), vc.x, vc.y, vc.z);
+            compute.SetFloat(Shader.PropertyToID("gsVoxSize"), voxelSize);
+            compute.SetTexture(kernel, Shader.PropertyToID("gsBakeSrcTsdf"), _volume);
+            compute.SetTexture(kernel, Shader.PropertyToID("gsBakeSrcColor"), _colorVolume);
+            compute.SetTexture(kernel, VolumeRWID, dstTsdf);
+            compute.SetTexture(kernel, ColorVolumeRWID, dstColor);
+            compute.SetMatrix(Shader.PropertyToID("gsBakeInvRelocation"), invRelocation);
+
+            int tx = Mathf.CeilToInt(vc.x / 4f);
+            int ty = Mathf.CeilToInt(vc.y / 4f);
+            int tz = Mathf.CeilToInt(vc.z / 4f);
+            compute.Dispatch(kernel, tx, ty, tz);
+            GL.Flush();
+
+            // Swap volumes: destroy old, adopt baked textures.
+            // Avoids Graphics.CopyTexture on 3D RTs which can silently fail on Vulkan/Quest.
+            Destroy(_volume);
+            Destroy(_colorVolume);
+            _volume = dstTsdf;
+            _colorVolume = dstColor;
+
+            // Rebind global texture references (used by render shader for freeze tint etc.)
+            Shader.SetGlobalTexture(VolumeID, _volume);
+            Shader.SetGlobalTexture(ColorVolumeID, _colorVolume);
+
+            // Rebind per-kernel UAV references so subsequent integrations/clears use new textures
+            RebindVolumeTextures();
+
+            Debug.Log($"[RoomScan] BakeRelocation complete — resampled {vc} voxels, " +
+                      $"reloc row0={relocationMatrix.GetRow(0)}, inv row0={invRelocation.GetRow(0)}");
+        }
+
+        private void RebindVolumeTextures()
+        {
+            if (_clearKernel.Shader == null) return;
+            _clearKernel.Set(VolumeRWID, _volume);
+            _clearKernel.Set(ColorVolumeRWID, _colorVolume);
+            _integrateKernel.Set(VolumeRWID, _volume);
+            _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
+            _pruneKernel.Set(VolumeRWID, _volume);
+            _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
+            _freezeKernel.Set(VolumeRWID, _volume);
+            _unfreezeKernel.Set(VolumeRWID, _volume);
+        }
+
+        /// <summary>
         /// Freeze all voxels currently visible in the camera frustum.
         /// Frozen voxels are encoded as negative weight and skip integration.
         /// Requires camera data to have been provided via SetCameraData.
@@ -466,29 +544,13 @@ namespace Genesis.RoomScan
             Graphics.CopyTexture(colorTex, _colorVolume);
             Destroy(colorTex);
 
+            GL.Flush();
+
             IntegrationCount = integrationCount;
             _frustumReady = false;
 
             Debug.Log($"[RoomScan] Volumes loaded: {s}, integrationCount={integrationCount}");
             return true;
-        }
-
-        public float3 VoxelToWorld(uint3 indices)
-        {
-            float3 pos = indices;
-            pos += 0.5f;
-            pos -= (float3)VoxelCount / 2.0f;
-            pos *= voxelSize;
-            return pos;
-        }
-
-        public int3 WorldToVoxel(float3 pos)
-        {
-            pos /= voxelSize;
-            pos += (float3)VoxelCount / 2.0f;
-            int3 id = (int3)math.floor(pos);
-            id = math.clamp(id, int3.zero, VoxelCount);
-            return id;
         }
     }
 }

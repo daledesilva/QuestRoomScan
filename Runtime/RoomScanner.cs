@@ -37,7 +37,7 @@ namespace Genesis.RoomScan
     [RequireComponent(typeof(DepthCapture), typeof(VolumeIntegrator), typeof(MeshExtractor))]
     [RequireComponent(typeof(PassthroughCameraProvider), typeof(TriplanarCache), typeof(RoomScanPersistence))]
     [RequireComponent(typeof(KeyframeCollector), typeof(PointCloudExporter), typeof(GSplatManager))]
-    [RequireComponent(typeof(GSplatServerClient))]
+    [RequireComponent(typeof(GSplatServerClient), typeof(RoomAnchorManager))]
     public class RoomScanner : MonoBehaviour
     {
         public static RoomScanner Instance { get; private set; }
@@ -71,7 +71,7 @@ namespace Genesis.RoomScan
 
         [Header("Persistence")]
         [SerializeField, Tooltip("Auto-save scan data when the application quits")]
-        private bool saveOnQuit = true;
+        private bool saveOnQuit = false;
 
         // ─────────────────────────────────────────────────────────────
         //  Sibling component cache (resolved in Awake)
@@ -89,6 +89,7 @@ namespace Genesis.RoomScan
         private GSplatServerClient _gsplatServerClient;
         private DebugMenuController _debugMenu;
         private ICameraProvider _customCameraProvider;
+        private RoomAnchorManager _roomAnchor;
 
         // ─────────────────────────────────────────────────────────────
         //  Public read-only state
@@ -147,7 +148,25 @@ namespace Genesis.RoomScan
         private void Start()
         {
             SetupHeadExclusion();
-            OnRoomReady();
+
+            if (_roomAnchor != null && _roomAnchor.enabled)
+            {
+                if (_roomAnchor.IsRoomLoaded)
+                    CompleteRoomStartup();
+                else
+                    _roomAnchor.RoomReady += OnRoomAnchorReady;
+            }
+            else
+                CompleteRoomStartup();
+        }
+
+        private void OnRoomAnchorReady()
+        {
+            if (_roomAnchor != null)
+                _roomAnchor.RoomReady -= OnRoomAnchorReady;
+            if (_started)
+                return;
+            CompleteRoomStartup();
         }
 
         private void CacheComponents()
@@ -163,10 +182,17 @@ namespace Genesis.RoomScan
             _gsplatManager = GetComponent<GSplatManager>();
             _gsplatServerClient = GetComponent<GSplatServerClient>();
             _debugMenu = GetComponentInChildren<DebugMenuController>();
+            _roomAnchor = GetComponent<RoomAnchorManager>();
         }
 
-        private void OnRoomReady()
+        /// <summary>
+        /// Finishes startup after MRUK room is ready (or immediately if <see cref="RoomAnchorManager"/> is disabled).
+        /// </summary>
+        private void CompleteRoomStartup()
         {
+            if (_started)
+                return;
+
             if (startScanningAutomatically)
                 StartScanning();
 
@@ -295,6 +321,7 @@ namespace Genesis.RoomScan
             ICameraProvider provider = GetActiveCameraProvider();
             provider?.StartCapture();
 
+            Debug.Log($"[RoomScan] StartScanning — integrationCount={_volumeIntegrator.IntegrationCount}");
             ScanStarted?.Invoke();
         }
 
@@ -336,7 +363,8 @@ namespace Genesis.RoomScan
         {
             _volumeIntegrator.Clear();
             _meshExtractor.Reinitialize();
-            if (_triplanarCache != null) _triplanarCache.Clear();
+            if (_triplanarCache != null)
+                _triplanarCache.Clear();
         }
 
         /// <summary>
@@ -495,6 +523,8 @@ namespace Genesis.RoomScan
                 return false;
 
             pose = pcp.CameraPose;
+            if (_depthCapture != null)
+                pose = _depthCapture.TrackingToWorld(pose);
             focal = pcp.FocalLength;
             principal = pcp.PrincipalPoint;
             sensor = pcp.SensorResolution;
@@ -534,6 +564,8 @@ namespace Genesis.RoomScan
                 if (frame != null)
                 {
                     Pose pose = pcp.CameraPose;
+                    if (_depthCapture != null)
+                        pose = _depthCapture.TrackingToWorld(pose);
                     Vector2 focal = pcp.FocalLength;
                     Vector2 principal = pcp.PrincipalPoint;
                     Vector2 sensor = pcp.SensorResolution;

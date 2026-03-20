@@ -13,6 +13,9 @@ namespace Genesis.RoomScan
         public static RoomScanPersistence Instance { get; private set; }
 
         private const uint Magic = 0x48534D52; // "RMSH"
+        /// <summary>
+        /// v1: header + anchor localToWorld (16 floats) + TSDF + color blobs.
+        /// </summary>
         private const int FormatVersion = 1;
 
         private string SaveDirectory => Path.Combine(Application.persistentDataPath, "RoomScans");
@@ -92,10 +95,15 @@ namespace Genesis.RoomScan
                 if (tc != null && tc.TriXZ != null)
                     triRes = tc.TriXZ.width;
 
+                Matrix4x4 anchorAtSave = Matrix4x4.identity;
+                var anchor = RoomAnchorManager.Instance;
+                if (anchor != null && anchor.enabled && anchor.IsRoomLoaded)
+                    anchorAtSave = anchor.GetRoomLocalToWorldForPersistence();
+
                 string savePath = SaveFilePath;
                 string triDir = TriplanarDirectory;
                 await Task.Run(() => WriteBinary(savePath, s, vi.VoxelSize,
-                    vi.IntegrationCount, tsdfBytes, colorBytes, triRes));
+                    vi.IntegrationCount, tsdfBytes, colorBytes, triRes, anchorAtSave));
 
                 tsdfBytes = null;
                 colorBytes = null;
@@ -107,7 +115,9 @@ namespace Genesis.RoomScan
                 }
 
                 float sizeMB = new FileInfo(savePath).Length / (1024f * 1024f);
-                Debug.Log($"[RoomScan] Persistence: saved to {savePath} ({sizeMB:F1}MB), triplanar={triRes > 0}");
+                Debug.Log($"[RoomScan] Persistence: saved to {savePath} ({sizeMB:F1}MB), " +
+                          $"triplanar={triRes > 0}, format=v{FormatVersion}, " +
+                          $"anchor col3={anchorAtSave.GetColumn(3)}, row0={anchorAtSave.GetRow(0)}");
                 SaveCompleted?.Invoke();
                 return true;
             }
@@ -163,11 +173,12 @@ namespace Genesis.RoomScan
                 float savedVoxSize = 0;
                 int savedIntCount = 0;
                 int triRes = 0;
+                Matrix4x4 anchorAtSave = Matrix4x4.identity;
 
                 Debug.Log("[RoomScan] Persistence: load reading file (background)...");
                 await Task.Run(() => ReadBinary(saveFilePath,
                     out savedVoxCount, out savedVoxSize, out savedIntCount,
-                    out tsdfBytes, out colorBytes, out triRes));
+                    out tsdfBytes, out colorBytes, out triRes, out anchorAtSave));
                 Debug.Log($"[RoomScan] Persistence: load read done voxels={savedVoxCount}, tsdf={tsdfBytes?.Length ?? 0}, color={colorBytes?.Length ?? 0}");
 
                 await SwitchToUnityMainThreadAsync(unitySync);
@@ -193,12 +204,53 @@ namespace Genesis.RoomScan
                 if (!vi.LoadVolumes(tsdfBytes, colorBytes, savedIntCount))
                     return false;
 
+                // Wait for MRUK room anchor before computing relocation.
+                // MRUK loads asynchronously from Start(); if the user triggers
+                // "Load Scan" before the room is ready, we'd skip the bake and
+                // the mesh would land at the old-session coordinates.
+                // Uses Task.Delay polling (not TCS event subscription) to avoid
+                // deadlocks with Unity's SynchronizationContext on IL2CPP/Quest.
+                var anchor = RoomAnchorManager.Instance;
+                if (anchor != null && anchor.enabled && !anchor.IsRoomLoaded)
+                {
+                    Debug.Log("[RoomScan] Persistence: waiting for MRUK room to load...");
+                    for (int i = 0; i < 300 && !anchor.IsRoomLoaded; i++)
+                    {
+                        await Task.Delay(16);
+                        await SwitchToUnityMainThreadAsync(unitySync);
+                    }
+                    if (anchor.IsRoomLoaded)
+                        Debug.Log("[RoomScan] Persistence: MRUK room loaded, proceeding");
+                    else
+                        Debug.LogWarning("[RoomScan] Persistence: MRUK room load timed out after ~5s, proceeding without relocation");
+                }
+
+                // Bake anchor-drift relocation: R = A_now * Inv(A_save).
+                Matrix4x4 reloc = Matrix4x4.identity;
+                if (anchor != null && anchor.enabled && anchor.IsRoomLoaded)
+                    reloc = anchor.ComputeRelocationMatrix(anchorAtSave);
+
+                if (reloc != Matrix4x4.identity)
+                {
+                    vi.BakeRelocation(reloc);
+                    Debug.Log("[RoomScan] Persistence: TSDF baked to identity");
+                }
+
                 var tc = TriplanarCache.Instance;
                 if (tc != null && triRes > 0 && Directory.Exists(triplanarDir))
                 {
                     try
                     {
-                        tc.Load(triplanarDir);
+                        if (reloc != Matrix4x4.identity)
+                        {
+                            tc.BakeRelocation(reloc, triplanarDir);
+                            Debug.Log("[RoomScan] Persistence: triplanar baked to identity (from disk)");
+                        }
+                        else
+                        {
+                            tc.Load(triplanarDir);
+                            tc.LoadDepth(triplanarDir);
+                        }
                     }
                     catch (Exception e)
                     {
@@ -209,8 +261,6 @@ namespace Genesis.RoomScan
                 if (cm != null)
                 {
                     cm.Reinitialize();
-                    // Scanner only calls Extract() while IsScanning; after load, volumes are
-                    // restored but GPU mesh buffers stay empty until we extract once here.
                     cm.Extract();
                     Debug.Log("[RoomScan] Persistence: mesh extracted from loaded volume");
                 }
@@ -240,7 +290,7 @@ namespace Genesis.RoomScan
 
         private static async Task SaveTriplanarOneAtATime(TriplanarCache tc, string dir)
         {
-            var planes = new[] {
+            var planes = new (RenderTexture rt, string filename)[] {
                 (tc.TriXZ, "tri_xz.raw"),
                 (tc.TriXY, "tri_xy.raw"),
                 (tc.TriYZ, "tri_yz.raw")
@@ -252,10 +302,24 @@ namespace Genesis.RoomScan
                 await Task.Run(() => File.WriteAllBytes(path, data));
                 data = null;
             }
+
+            var depthPlanes = new (RenderTexture rt, string filename)[] {
+                (tc.DepthXZ, "depth_xz.raw"),
+                (tc.DepthXY, "depth_xy.raw"),
+                (tc.DepthYZ, "depth_yz.raw")
+            };
+            foreach (var (rt, filename) in depthPlanes)
+            {
+                byte[] data = TriplanarCache.ReadDepthRTBytes(rt);
+                string path = Path.Combine(dir, filename);
+                await Task.Run(() => File.WriteAllBytes(path, data));
+                data = null;
+            }
         }
 
         private static void WriteBinary(string path, int3 voxCount, float voxSize,
-            int integrationCount, byte[] tsdfBytes, byte[] colorBytes, int triplanarRes)
+            int integrationCount, byte[] tsdfBytes, byte[] colorBytes, int triplanarRes,
+            Matrix4x4 anchorAtSave)
         {
             using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 65536);
             using var w = new BinaryWriter(fs);
@@ -271,6 +335,8 @@ namespace Genesis.RoomScan
             w.Write(integrationCount);
             w.Write(triplanarRes);
 
+            WriteMatrix4(w, anchorAtSave);
+
             w.Write(tsdfBytes.Length);
             w.Write(tsdfBytes);
 
@@ -278,9 +344,32 @@ namespace Genesis.RoomScan
             w.Write(colorBytes);
         }
 
+        private static void WriteMatrix4(BinaryWriter w, Matrix4x4 m)
+        {
+            w.Write(m.m00); w.Write(m.m01); w.Write(m.m02); w.Write(m.m03);
+            w.Write(m.m10); w.Write(m.m11); w.Write(m.m12); w.Write(m.m13);
+            w.Write(m.m20); w.Write(m.m21); w.Write(m.m22); w.Write(m.m23);
+            w.Write(m.m30); w.Write(m.m31); w.Write(m.m32); w.Write(m.m33);
+        }
+
+        private static Matrix4x4 ReadMatrix4(BinaryReader r)
+        {
+            // Written row-by-row (m00..m03, m10..); Unity ctor expects column vectors.
+            float m00 = r.ReadSingle(), m01 = r.ReadSingle(), m02 = r.ReadSingle(), m03 = r.ReadSingle();
+            float m10 = r.ReadSingle(), m11 = r.ReadSingle(), m12 = r.ReadSingle(), m13 = r.ReadSingle();
+            float m20 = r.ReadSingle(), m21 = r.ReadSingle(), m22 = r.ReadSingle(), m23 = r.ReadSingle();
+            float m30 = r.ReadSingle(), m31 = r.ReadSingle(), m32 = r.ReadSingle(), m33 = r.ReadSingle();
+            return new Matrix4x4(
+                new Vector4(m00, m10, m20, m30),
+                new Vector4(m01, m11, m21, m31),
+                new Vector4(m02, m12, m22, m32),
+                new Vector4(m03, m13, m23, m33));
+        }
+
         private static void ReadBinary(string path,
             out int3 voxCount, out float voxSize, out int integrationCount,
-            out byte[] tsdfBytes, out byte[] colorBytes, out int triplanarRes)
+            out byte[] tsdfBytes, out byte[] colorBytes, out int triplanarRes,
+            out Matrix4x4 anchorAtSave)
         {
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536);
             using var r = new BinaryReader(fs);
@@ -290,8 +379,9 @@ namespace Genesis.RoomScan
                 throw new InvalidDataException($"Bad magic: 0x{magic:X8}, expected 0x{Magic:X8}");
 
             int version = r.ReadInt32();
-            if (version > FormatVersion)
-                throw new InvalidDataException($"Unsupported version: {version}");
+            if (version != FormatVersion)
+                throw new InvalidDataException(
+                    $"scan.bin format v{version} is not supported (need v{FormatVersion}). Delete RoomScans on device.");
 
             r.ReadInt64(); // timestamp
 
@@ -299,6 +389,8 @@ namespace Genesis.RoomScan
             voxSize = r.ReadSingle();
             integrationCount = r.ReadInt32();
             triplanarRes = r.ReadInt32();
+
+            anchorAtSave = ReadMatrix4(r);
 
             int tsdfLen = r.ReadInt32();
             tsdfBytes = r.ReadBytes(tsdfLen);

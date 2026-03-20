@@ -115,6 +115,9 @@ namespace Genesis.RoomScan
 
             _gpuSurfaceNets.Extract(_volume.Volume, _volume.ColorVolume, _volume.VoxelSize);
 
+            if (_gpuRenderer != null)
+                _gpuRenderer.UpdateBounds(_gpuSurfaceNets.GetVolumeBounds(_volume.VoxelSize));
+
             if (_extractCount <= 3 || _extractCount % 50 == 0)
                 Debug.Log($"[RoomScan] GPU extraction #{_extractCount}");
         }

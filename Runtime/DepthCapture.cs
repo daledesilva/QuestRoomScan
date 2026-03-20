@@ -77,6 +77,7 @@ namespace Genesis.RoomScan
 
         private AROcclusionManager _arOcclusionManager;
         private Unity.XR.CoreUtils.XROrigin _xrOrigin;
+        private Transform _trackingSpaceTransform;
         private Camera _mainCam;
         private bool _started;
         private bool _dilationDirty;
@@ -88,6 +89,18 @@ namespace Genesis.RoomScan
         public event Action Updated;
 
         private static readonly Vector3 ScaleFlipZ = new(1, 1, -1);
+
+        /// <summary>
+        /// Convert a pose from XR tracking space to Unity world space.
+        /// Required because MRUK's world-lock may offset TrackingSpace from the XROrigin root.
+        /// </summary>
+        public Pose TrackingToWorld(Pose trackingPose)
+        {
+            if (_trackingSpaceTransform == null) return trackingPose;
+            return new Pose(
+                _trackingSpaceTransform.TransformPoint(trackingPose.position),
+                _trackingSpaceTransform.rotation * trackingPose.rotation);
+        }
 
         private void Awake()
         {
@@ -103,6 +116,7 @@ namespace Genesis.RoomScan
                 throw new Exception("[RoomScan] AROcclusionManager not found in scene");
 
             _xrOrigin = FindFirstObjectByType<Unity.XR.CoreUtils.XROrigin>();
+            CacheTrackingSpaceTransform();
 
             _normKernel = new ComputeKernelHelper(depthNormalCompute, "DepthNorm");
             _monoConvertKernel = new ComputeKernelHelper(depthNormalCompute, "MonoRawDepthToStereo");
@@ -118,6 +132,35 @@ namespace Genesis.RoomScan
             CheckPermissionAndEnable();
 
             _started = true;
+        }
+
+        /// <summary>
+        /// Resolves the TrackingSpace transform — the parent of the XR cameras that
+        /// MRUK world-lock can reposition each frame. Using this instead of the XROrigin
+        /// root ensures depth-to-world conversion includes the world-lock offset.
+        /// </summary>
+        private void CacheTrackingSpaceTransform()
+        {
+            // Prefer OVRCameraRig.trackingSpace (most reliable on Meta devices)
+            var ovrRig = FindFirstObjectByType<OVRCameraRig>();
+            if (ovrRig != null && ovrRig.trackingSpace != null)
+            {
+                _trackingSpaceTransform = ovrRig.trackingSpace;
+                Debug.Log($"[RoomScan] DepthCapture: using OVRCameraRig.trackingSpace '{_trackingSpaceTransform.name}'");
+                return;
+            }
+
+            // Fallback: XROrigin.CameraFloorOffsetObject
+            if (_xrOrigin != null && _xrOrigin.CameraFloorOffsetObject != null)
+            {
+                _trackingSpaceTransform = _xrOrigin.CameraFloorOffsetObject.transform;
+                Debug.Log($"[RoomScan] DepthCapture: using XROrigin.CameraFloorOffsetObject '{_trackingSpaceTransform.name}'");
+                return;
+            }
+
+            // Last resort: XROrigin root (pre-fix behaviour)
+            _trackingSpaceTransform = _xrOrigin != null ? _xrOrigin.transform : null;
+            Debug.LogWarning("[RoomScan] DepthCapture: no TrackingSpace found, falling back to XROrigin root");
         }
 
         private void EnsureARSession()
@@ -328,8 +371,8 @@ namespace Genesis.RoomScan
                 Pose pose = poses[i];
                 Matrix4x4 depthFrameMat = Matrix4x4.TRS(pose.position, pose.rotation, ScaleFlipZ);
 
-                Matrix4x4 worldToTracking = _xrOrigin != null
-                    ? _xrOrigin.transform.worldToLocalMatrix
+                Matrix4x4 worldToTracking = _trackingSpaceTransform != null
+                    ? _trackingSpaceTransform.worldToLocalMatrix
                     : Matrix4x4.identity;
 
                 _view[i] = depthFrameMat.inverse * worldToTracking;

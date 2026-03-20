@@ -207,6 +207,9 @@ Texture2D<float>  gsRelocSrcDepth;
 RWTexture2D<float4> gsRelocDstXZ;
 RWTexture2D<float4> gsRelocDstXY;
 RWTexture2D<float4> gsRelocDstYZ;
+RWTexture2D<float> gsRelocDstDepthXZ;
+RWTexture2D<float> gsRelocDstDepthXY;
+RWTexture2D<float> gsRelocDstDepthYZ;
 float4x4 gsRelocMatrix;
 int gsRelocSrcFace;
 float3 gsRelocVoxCount;
@@ -258,9 +261,9 @@ void ForwardSplatRelocation(uint3 id : SV_DispatchThreadID)
     if (dstCoord.x < 0 || dstCoord.y < 0 ||
         (uint)dstCoord.x >= gsTriSize.x || (uint)dstCoord.y >= gsTriSize.y) return;
 
-    if (newFace == 0)      gsRelocDstXZ[dstCoord] = oldColor;
-    else if (newFace == 1) gsRelocDstXY[dstCoord] = oldColor;
-    else                   gsRelocDstYZ[dstCoord] = oldColor;
+    if (newFace == 0)      { gsRelocDstXZ[dstCoord] = oldColor; gsRelocDstDepthXZ[dstCoord] = newUVW.y; }
+    else if (newFace == 1) { gsRelocDstXY[dstCoord] = oldColor; gsRelocDstDepthXY[dstCoord] = newUVW.z; }
+    else                   { gsRelocDstYZ[dstCoord] = oldColor; gsRelocDstDepthYZ[dstCoord] = newUVW.x; }
 }
 
 // ──────────────────────────────────────────────────────────────────

@@ -174,6 +174,11 @@ namespace Genesis.RoomScan
                 CreateTriplanarRT("RelocXY"),
                 CreateTriplanarRT("RelocYZ")
             };
+            var dstDepths = new RenderTexture[] {
+                CreateDepthRT("RelocDepthXZ"),
+                CreateDepthRT("RelocDepthXY"),
+                CreateDepthRT("RelocDepthYZ")
+            };
 
             // Forward-splat compute: 3 dispatches (one per src face).
             var relocKernel = new ComputeKernelHelper(bakeCompute, "ForwardSplatRelocation");
@@ -182,6 +187,9 @@ namespace Genesis.RoomScan
             int dstXZID = Shader.PropertyToID("gsRelocDstXZ");
             int dstXYID = Shader.PropertyToID("gsRelocDstXY");
             int dstYZID = Shader.PropertyToID("gsRelocDstYZ");
+            int dstDepthXZID = Shader.PropertyToID("gsRelocDstDepthXZ");
+            int dstDepthXYID = Shader.PropertyToID("gsRelocDstDepthXY");
+            int dstDepthYZID = Shader.PropertyToID("gsRelocDstDepthYZ");
 
             bakeCompute.SetMatrix(Shader.PropertyToID("gsRelocMatrix"), relocationMatrix);
             bakeCompute.SetVector(Shader.PropertyToID("gsRelocVoxCount"),
@@ -192,6 +200,9 @@ namespace Genesis.RoomScan
             relocKernel.Set(dstXZID, dsts[0]);
             relocKernel.Set(dstXYID, dsts[1]);
             relocKernel.Set(dstYZID, dsts[2]);
+            relocKernel.Set(dstDepthXZID, dstDepths[0]);
+            relocKernel.Set(dstDepthXYID, dstDepths[1]);
+            relocKernel.Set(dstDepthYZID, dstDepths[2]);
 
             for (int srcFace = 0; srcFace < 3; srcFace++)
             {
@@ -242,9 +253,7 @@ namespace Genesis.RoomScan
             if (_depthYZ) Destroy(_depthYZ);
 
             _triXZ = dsts[0]; _triXY = dsts[1]; _triYZ = dsts[2];
-            _depthXZ = CreateDepthRT("DepthXZ");
-            _depthXY = CreateDepthRT("DepthXY");
-            _depthYZ = CreateDepthRT("DepthYZ");
+            _depthXZ = dstDepths[0]; _depthXY = dstDepths[1]; _depthYZ = dstDepths[2];
 
             Shader.SetGlobalTexture(TriXZID, _triXZ);
             Shader.SetGlobalTexture(TriXYID, _triXY);

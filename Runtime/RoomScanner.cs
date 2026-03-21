@@ -233,6 +233,12 @@ namespace Genesis.RoomScan
             {
                 _clearDone = false;
                 _clearInProgress = false;
+
+                // Re-create GPU mesh pipeline (deferred from ClearAllDataAsync to
+                // give the GPU a frame to finish using the old buffers).
+                if (_meshExtractor != null && !_meshExtractor.IsInitialized)
+                    _meshExtractor.Reinitialize();
+
                 if (_keyframeCollector != null)
                     _keyframeCollector.ReinitExportDir();
                 Debug.Log("[RoomScan] All scan + export data cleared");
@@ -372,26 +378,49 @@ namespace Genesis.RoomScan
         /// textures, and GSExport (keyframes + point cloud). Safe to call at runtime.
         /// File I/O runs on a background thread via ThreadPool to avoid main-thread
         /// stalls and potential SynchronizationContext deadlocks on Quest/IL2CPP.
+        /// GPU resources are disposed without immediate re-allocation to avoid
+        /// Vulkan stalls when the GPU is still referencing the previous frame's buffers.
+        /// Re-initialization happens lazily on the next <see cref="StartScanning"/> or load.
         /// </summary>
         public void ClearAllDataAsync(Action onComplete = null)
         {
             if (_clearInProgress) return;
             _clearInProgress = true;
 
-            StopScanning();
-            ClearScan();
-
-            if (_keyframeCollector != null)
-                _keyframeCollector.ClearInMemory();
-
-            _gsplatManager?.ClearSplat();
-            _gsplatManager?.ResetSplatTransform();
-            _downloadedPlyData = null;
-
-            string scanFile = _persistence != null ? _persistence.SaveFilePath : null;
-            string triDir = _persistence != null ? _persistence.TriplanarDirectory : null;
-            string splatFile = _persistence != null ? _persistence.SplatFilePath : null;
+            string scanFile = null;
+            string triDir = null;
+            string splatFile = null;
             string gsExportDir = Path.Combine(Application.persistentDataPath, "GSExport");
+
+            try
+            {
+                StopScanning();
+
+                // Disable rendering before disposing GPU resources to prevent
+                // LateUpdate draw calls that reference the buffers being freed.
+                _gsplatManager?.ClearSplat();
+                _gsplatManager?.ResetSplatTransform();
+                _downloadedPlyData = null;
+
+                // Dispose mesh GPU resources without re-allocating (avoids Vulkan stall).
+                _meshExtractor.DisposeOnly();
+                _volumeIntegrator.Clear();
+                if (_triplanarCache != null)
+                    _triplanarCache.Clear();
+
+                if (_keyframeCollector != null)
+                    _keyframeCollector.ClearInMemory();
+
+                scanFile = _persistence != null ? _persistence.SaveFilePath : null;
+                triDir = _persistence != null ? _persistence.TriplanarDirectory : null;
+                splatFile = _persistence != null ? _persistence.SplatFilePath : null;
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[RoomScan] ClearAllData sync error: {e.Message}\n{e.StackTrace}");
+                _clearInProgress = false;
+                return;
+            }
 
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
             {

@@ -46,6 +46,7 @@ namespace Genesis.RoomScan
         private int _extractCount;
 
         public GPUSurfaceNets GpuSurfaceNets => _gpuSurfaceNets;
+        public bool IsInitialized => _gpuSurfaceNets != null;
 
         private VolumeIntegrator _volume;
 
@@ -123,13 +124,36 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
+        /// Release GPU resources without re-creating them.
+        /// Used by ClearAllData to avoid a heavy re-alloc while the GPU may
+        /// still be referencing the old buffers from the previous frame's draw.
+        /// Call <see cref="Reinitialize"/> when resources are needed again.
+        /// </summary>
+        public void DisposeOnly()
+        {
+            if (_gpuRenderer != null)
+            {
+                _gpuRenderer.RenderVisible = false;
+                Destroy(_gpuRenderer);
+                _gpuRenderer = null;
+            }
+            _gpuSurfaceNets?.Dispose();
+            _gpuSurfaceNets = null;
+        }
+
+        /// <summary>
         /// Dispose GPU resources and reinitialize. Used after loading a saved scan.
         /// </summary>
         public void Reinitialize()
         {
+            if (_gpuRenderer != null)
+            {
+                _gpuRenderer.RenderVisible = false;
+                Destroy(_gpuRenderer);
+                _gpuRenderer = null;
+            }
             _gpuSurfaceNets?.Dispose();
             _gpuSurfaceNets = null;
-            if (_gpuRenderer != null) Destroy(_gpuRenderer);
             Init();
         }
     }

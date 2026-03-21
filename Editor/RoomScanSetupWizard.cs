@@ -575,7 +575,7 @@ namespace Genesis.RoomScan.Editor
             // DepthCapture, VolumeIntegrator, MeshExtractor,
             // PassthroughCameraProvider, TriplanarCache, RoomScanPersistence,
             // KeyframeCollector, PointCloudExporter, GSplatManager,
-            // GSplatServerClient, RoomAnchorManager (GaussianSplatRenderer via GSplatManager)
+            // GSplatServerClient, RoomAnchorManager (GaussianSplatRenderer created by GSplatManager on child GO)
             if (root.GetComponent<RoomScanner>() == null)
                 Undo.AddComponent<RoomScanner>(root);
 

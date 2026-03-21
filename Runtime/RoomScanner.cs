@@ -384,8 +384,13 @@ namespace Genesis.RoomScan
             if (_keyframeCollector != null)
                 _keyframeCollector.ClearInMemory();
 
+            _gsplatManager?.ClearSplat();
+            _gsplatManager?.ResetSplatTransform();
+            _downloadedPlyData = null;
+
             string scanFile = _persistence != null ? _persistence.SaveFilePath : null;
             string triDir = _persistence != null ? _persistence.TriplanarDirectory : null;
+            string splatFile = _persistence != null ? _persistence.SplatFilePath : null;
             string gsExportDir = Path.Combine(Application.persistentDataPath, "GSExport");
 
             System.Threading.ThreadPool.QueueUserWorkItem(_ =>
@@ -396,6 +401,8 @@ namespace Genesis.RoomScan
                         File.Delete(scanFile);
                     if (triDir != null && Directory.Exists(triDir))
                         Directory.Delete(triDir, true);
+                    if (splatFile != null && File.Exists(splatFile))
+                        File.Delete(splatFile);
                     if (Directory.Exists(gsExportDir))
                         Directory.Delete(gsExportDir, true);
                 }
@@ -623,6 +630,16 @@ namespace Genesis.RoomScan
         public bool HasDownloadedSplat => _downloadedPlyData != null && _downloadedPlyData.Length > 0;
 
         private byte[] _downloadedPlyData;
+
+        /// <summary>
+        /// Raw PLY bytes from server training or loaded from disk.
+        /// Used by persistence to save/restore Gaussian Splat data.
+        /// </summary>
+        public byte[] DownloadedPlyData
+        {
+            get => _downloadedPlyData;
+            set => _downloadedPlyData = value;
+        }
 
         /// <summary>
         /// Loads the downloaded splat into GPU buffers and switches to splat render mode.

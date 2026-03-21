@@ -21,6 +21,7 @@ namespace Genesis.RoomScan
         private string SaveDirectory => Path.Combine(Application.persistentDataPath, "RoomScans");
         public string SaveFilePath => Path.Combine(SaveDirectory, "scan.bin");
         public string TriplanarDirectory => Path.Combine(SaveDirectory, "triplanar");
+        public string SplatFilePath => Path.Combine(SaveDirectory, "splat.ply");
 
         public bool IsSaving { get; private set; }
         public bool IsLoading { get; private set; }
@@ -114,9 +115,19 @@ namespace Genesis.RoomScan
                     await SaveTriplanarOneAtATime(tc, triDir);
                 }
 
+                var plyData = RoomScanner.Instance?.DownloadedPlyData;
+                bool splatSaved = false;
+                if (plyData != null && plyData.Length > 0)
+                {
+                    string splatPath = SplatFilePath;
+                    await Task.Run(() => File.WriteAllBytes(splatPath, plyData));
+                    splatSaved = true;
+                    Debug.Log($"[RoomScan] Persistence: splat.ply saved ({plyData.Length / (1024f * 1024f):F1}MB)");
+                }
+
                 float sizeMB = new FileInfo(savePath).Length / (1024f * 1024f);
                 Debug.Log($"[RoomScan] Persistence: saved to {savePath} ({sizeMB:F1}MB), " +
-                          $"triplanar={triRes > 0}, format=v{FormatVersion}, " +
+                          $"triplanar={triRes > 0}, splat={splatSaved}, format=v{FormatVersion}, " +
                           $"anchor col3={anchorAtSave.GetColumn(3)}, row0={anchorAtSave.GetRow(0)}");
                 SaveCompleted?.Invoke();
                 return true;
@@ -265,7 +276,47 @@ namespace Genesis.RoomScan
                     Debug.Log("[RoomScan] Persistence: mesh extracted from loaded volume");
                 }
 
-                Debug.Log($"[RoomScan] Persistence: loaded scan (integrations={savedIntCount})");
+                // Load Gaussian Splat PLY if saved alongside scan data.
+                string splatPath = SplatFilePath;
+                bool splatExists = File.Exists(splatPath);
+                if (splatExists)
+                {
+                    try
+                    {
+                        byte[] plyBytes = null;
+                        await Task.Run(() => plyBytes = File.ReadAllBytes(splatPath));
+                        await SwitchToUnityMainThreadAsync(unitySync);
+
+                        var scanner = RoomScanner.Instance;
+                        var gm = scanner != null ? scanner.GetComponent<GSplat.GSplatManager>() : null;
+                        if (gm != null && plyBytes != null && plyBytes.Length > 0)
+                        {
+                            gm.LoadTrainedPly(plyBytes);
+                            if (scanner != null)
+                                scanner.DownloadedPlyData = plyBytes;
+
+                            if (reloc != Matrix4x4.identity && gm.SplatHolder != null)
+                            {
+                                var pos = new Vector3(reloc.m03, reloc.m13, reloc.m23);
+                                var rot = reloc.rotation;
+                                gm.SplatHolder.SetPositionAndRotation(pos, rot);
+                                Debug.Log($"[RoomScan] Persistence: splat relocated pos={pos}, rot={rot.eulerAngles}");
+                            }
+                            else
+                            {
+                                gm.ResetSplatTransform();
+                            }
+
+                            Debug.Log($"[RoomScan] Persistence: splat.ply loaded ({plyBytes.Length / (1024f * 1024f):F1}MB)");
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Debug.LogWarning($"[RoomScan] Persistence: splat load skipped ({e.Message})");
+                    }
+                }
+
+                Debug.Log($"[RoomScan] Persistence: loaded scan (integrations={savedIntCount}, splat={splatExists})");
                 LoadCompleted?.Invoke();
                 return true;
             }

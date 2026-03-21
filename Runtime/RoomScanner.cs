@@ -25,8 +25,8 @@ namespace Genesis.RoomScan
     public enum ScanRenderMode
     {
         Mesh,
-        Splat,
-        Both
+        Textured,
+        Splat
     }
 
     /// <summary>
@@ -435,12 +435,12 @@ namespace Genesis.RoomScan
         {
             var next = renderMode switch
             {
-                ScanRenderMode.Mesh => ScanRenderMode.Splat,
-                ScanRenderMode.Splat => ScanRenderMode.Both,
+                ScanRenderMode.Mesh => ScanRenderMode.Textured,
+                ScanRenderMode.Textured => ScanRenderMode.Splat,
                 _ => ScanRenderMode.Mesh,
             };
 
-            if (next != ScanRenderMode.Mesh && HasDownloadedSplat && !_gsplatManager.HasServerTrainedSplats)
+            if (next == ScanRenderMode.Splat && HasDownloadedSplat && !_gsplatManager.HasServerTrainedSplats)
                 LoadDownloadedSplat();
             else
                 SetRenderMode(next);
@@ -614,14 +614,19 @@ namespace Genesis.RoomScan
                 Vector2.one, Vector2.zero, Vector2.one, Vector2.one);
         }
 
+        private static readonly int NoFreezeTintID = Shader.PropertyToID("_RSNoFreezeTint");
+
         private void ApplyRenderMode()
         {
             var gpuRenderer = _meshExtractor != null ? _meshExtractor.GetComponent<GPUMeshRenderer>() : null;
 
+            bool meshVisible = renderMode == ScanRenderMode.Mesh || renderMode == ScanRenderMode.Textured;
             if (gpuRenderer != null)
-                gpuRenderer.RenderVisible = renderMode == ScanRenderMode.Mesh || renderMode == ScanRenderMode.Both;
+                gpuRenderer.RenderVisible = meshVisible;
             if (_gsplatManager != null)
-                _gsplatManager.RenderVisible = renderMode == ScanRenderMode.Splat || renderMode == ScanRenderMode.Both;
+                _gsplatManager.RenderVisible = renderMode == ScanRenderMode.Splat;
+
+            Shader.SetGlobalFloat(NoFreezeTintID, renderMode == ScanRenderMode.Textured ? 1f : 0f);
         }
 
         /// <summary>

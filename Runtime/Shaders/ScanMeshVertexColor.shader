@@ -129,9 +129,11 @@ Shader "Genesis/ScanMeshVertexColor"
                 return tsdf.g < 0;
             }
 
+            float _RSNoFreezeTint;
+
             half3 ApplyFreezeTint(half3 color, float3 worldPos)
             {
-                if (IsVoxelFrozen(worldPos))
+                if (_RSNoFreezeTint < 0.5 && IsVoxelFrozen(worldPos))
                     color = lerp(color, half3(0.3, 0.5, 0.9), 0.25);
                 return color;
             }

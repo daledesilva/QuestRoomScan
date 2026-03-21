@@ -236,6 +236,33 @@ namespace Genesis.RoomScan
                         Debug.LogWarning("[RoomScan] Persistence: MRUK room load timed out after ~5s, proceeding without relocation");
                 }
 
+                // Wait for the spatial anchor pose to stabilize. MRUK may fire
+                // SceneLoadedEvent before the tracking system has fully localized
+                // the anchor, causing the pose to drift over subsequent frames.
+                if (anchor != null && anchor.enabled && anchor.IsRoomLoaded)
+                {
+                    Matrix4x4 prevPose = anchor.GetRoomLocalToWorldForPersistence();
+                    int stableFrames = 0;
+                    const int requiredStableFrames = 5;
+                    const int maxStabilizationPolls = 60; // ~1s at 60fps
+                    for (int i = 0; i < maxStabilizationPolls && stableFrames < requiredStableFrames; i++)
+                    {
+                        await Task.Delay(16);
+                        await SwitchToUnityMainThreadAsync(unitySync);
+                        Matrix4x4 curPose = anchor.GetRoomLocalToWorldForPersistence();
+                        float posDelta = Vector3.Distance(
+                            new Vector3(prevPose.m03, prevPose.m13, prevPose.m23),
+                            new Vector3(curPose.m03, curPose.m13, curPose.m23));
+                        if (posDelta < 0.001f)
+                            stableFrames++;
+                        else
+                            stableFrames = 0;
+                        prevPose = curPose;
+                    }
+                    Debug.Log($"[RoomScan] Persistence: anchor stabilized after {stableFrames >= requiredStableFrames} " +
+                              $"(stableFrames={stableFrames}, pos={new Vector3(prevPose.m03, prevPose.m13, prevPose.m23)})");
+                }
+
                 // Bake anchor-drift relocation: R = A_now * Inv(A_save).
                 Matrix4x4 reloc = Matrix4x4.identity;
                 if (anchor != null && anchor.enabled && anchor.IsRoomLoaded)
@@ -292,6 +319,8 @@ namespace Genesis.RoomScan
                         if (gm != null && plyBytes != null && plyBytes.Length > 0)
                         {
                             gm.LoadTrainedPly(plyBytes);
+                            gm.RenderVisible = scanner != null &&
+                                scanner.CurrentRenderMode == ScanRenderMode.Splat;
                             if (scanner != null)
                                 scanner.DownloadedPlyData = plyBytes;
 

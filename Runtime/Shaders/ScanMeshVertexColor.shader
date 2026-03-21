@@ -53,10 +53,13 @@ Shader "Genesis/ScanMeshVertexColor"
                     ((packed >> 24)& 0xFF) / 255.0h);
             }
 
-            // Triplanar persistent textures
+            // Triplanar persistent textures (color + depth for missing axis)
             TEXTURE2D(_RSTriXZ);  SAMPLER(sampler_RSTriXZ);
             TEXTURE2D(_RSTriXY);  SAMPLER(sampler_RSTriXY);
             TEXTURE2D(_RSTriYZ);  SAMPLER(sampler_RSTriYZ);
+            TEXTURE2D(_RSTriDepthXZ);  SAMPLER(sampler_RSTriDepthXZ);
+            TEXTURE2D(_RSTriDepthXY);  SAMPLER(sampler_RSTriDepthXY);
+            TEXTURE2D(_RSTriDepthYZ);  SAMPLER(sampler_RSTriDepthYZ);
             float _RSTriAvailable;
 
             // TSDF volume (for freeze tint feedback)
@@ -66,6 +69,11 @@ Shader "Genesis/ScanMeshVertexColor"
             // Volume params (set by VolumeIntegrator as globals)
             float4 gsVoxCount;
             float gsVoxSize;
+
+            // Depth tolerance in UVW space — reject texels whose stored depth
+            // differs from the vertex's actual missing-axis coordinate by more
+            // than this. ~2 voxels in a 256-wide grid ≈ 0.008.
+            #define DEPTH_TOLERANCE 0.015
 
             float3 WorldToVoxelUVW(float3 worldPos)
             {
@@ -91,6 +99,16 @@ Shader "Genesis/ScanMeshVertexColor"
                 half4 colXZ = SAMPLE_TEXTURE2D(_RSTriXZ, sampler_RSTriXZ, uvXZ);
                 half4 colXY = SAMPLE_TEXTURE2D(_RSTriXY, sampler_RSTriXY, uvXY);
                 half4 colYZ = SAMPLE_TEXTURE2D(_RSTriYZ, sampler_RSTriYZ, uvYZ);
+
+                // Depth rejection: compare vertex's missing axis against stored depth.
+                // XZ face stores Y, XY face stores Z, YZ face stores X.
+                float dXZ = SAMPLE_TEXTURE2D(_RSTriDepthXZ, sampler_RSTriDepthXZ, uvXZ).r;
+                float dXY = SAMPLE_TEXTURE2D(_RSTriDepthXY, sampler_RSTriDepthXY, uvXY).r;
+                float dYZ = SAMPLE_TEXTURE2D(_RSTriDepthYZ, sampler_RSTriDepthYZ, uvYZ).r;
+
+                if (dXZ > 0.001 && abs(uvw.y - dXZ) > DEPTH_TOLERANCE) colXZ = half4(0, 0, 0, 0);
+                if (dXY > 0.001 && abs(uvw.z - dXY) > DEPTH_TOLERANCE) colXY = half4(0, 0, 0, 0);
+                if (dYZ > 0.001 && abs(uvw.x - dYZ) > DEPTH_TOLERANCE) colYZ = half4(0, 0, 0, 0);
 
                 half3 rgb = colXZ.rgb * blend.y + colXY.rgb * blend.z + colYZ.rgb * blend.x;
                 half totalAlpha = colXZ.a * blend.y + colXY.a * blend.z + colYZ.a * blend.x;

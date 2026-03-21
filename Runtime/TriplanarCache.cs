@@ -32,6 +32,9 @@ namespace Genesis.RoomScan
         static readonly int TriXZID = Shader.PropertyToID("_RSTriXZ");
         static readonly int TriXYID = Shader.PropertyToID("_RSTriXY");
         static readonly int TriYZID = Shader.PropertyToID("_RSTriYZ");
+        static readonly int DepthXZID = Shader.PropertyToID("_RSTriDepthXZ");
+        static readonly int DepthXYID = Shader.PropertyToID("_RSTriDepthXY");
+        static readonly int DepthYZID = Shader.PropertyToID("_RSTriDepthYZ");
         static readonly int TriAvailableID = Shader.PropertyToID("_RSTriAvailable");
 
         static readonly int TriXZRWID = Shader.PropertyToID("gsTriXZ_RW");
@@ -138,6 +141,9 @@ namespace Genesis.RoomScan
             if (_triXZ) Shader.SetGlobalTexture(TriXZID, _triXZ);
             if (_triXY) Shader.SetGlobalTexture(TriXYID, _triXY);
             if (_triYZ) Shader.SetGlobalTexture(TriYZID, _triYZ);
+            if (_depthXZ) Shader.SetGlobalTexture(DepthXZID, _depthXZ);
+            if (_depthXY) Shader.SetGlobalTexture(DepthXYID, _depthXY);
+            if (_depthYZ) Shader.SetGlobalTexture(DepthYZID, _depthYZ);
             Shader.SetGlobalFloat(TriAvailableID, _triXZ != null ? 1f : 0f);
         }
 
@@ -258,6 +264,9 @@ namespace Genesis.RoomScan
             Shader.SetGlobalTexture(TriXZID, _triXZ);
             Shader.SetGlobalTexture(TriXYID, _triXY);
             Shader.SetGlobalTexture(TriYZID, _triYZ);
+            Shader.SetGlobalTexture(DepthXZID, _depthXZ);
+            Shader.SetGlobalTexture(DepthXYID, _depthXY);
+            Shader.SetGlobalTexture(DepthYZID, _depthYZ);
             Shader.SetGlobalFloat(TriAvailableID, 1f);
 
             if (_clearKernel.Shader != null)

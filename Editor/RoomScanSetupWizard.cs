@@ -579,6 +579,20 @@ namespace Genesis.RoomScan.Editor
             if (root.GetComponent<RoomScanner>() == null)
                 Undo.AddComponent<RoomScanner>(root);
 
+            // GaussianSplatRenderer lives on a child GO so its transform can be
+            // set independently for room-anchor relocation. GSplatManager.Awake()
+            // creates this at runtime, but we also need it in the editor for shader wiring.
+            var splatChild = root.transform.Find("SplatRenderer");
+            if (splatChild == null)
+            {
+                var go = new GameObject("SplatRenderer");
+                go.transform.SetParent(root.transform, false);
+                Undo.RegisterCreatedObjectUndo(go, "Create SplatRenderer");
+                splatChild = go.transform;
+            }
+            if (splatChild.GetComponent<GaussianSplatRenderer>() == null)
+                Undo.AddComponent<GaussianSplatRenderer>(splatChild.gameObject);
+
             // Optional components not covered by RequireComponent
             if (root.GetComponent<RoomScanInputHandler>() == null)
                 Undo.AddComponent<RoomScanInputHandler>(root);

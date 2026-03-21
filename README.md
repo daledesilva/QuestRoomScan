@@ -123,6 +123,14 @@ Scanning continues during training — you can keep refining the mesh while wait
 - **Auto-save on quit**: If enabled, the scan is automatically saved when the app exits (default off)
 - **Clear All Data**: Stops scanning, clears volumes/mesh/triplanar/keyframes, deletes saved scan and GSExport from disk
 
+> **Known issue — Load alignment**: The MRUK room anchor may not be fully stabilized immediately after the app launches. If a loaded scan appears misaligned with the physical room, try one of these workarounds:
+>
+> 1. **Wait a few seconds** after launch before pressing Load — give the headset time to localize the room anchor.
+> 2. **Clear and reload** — press Clear All Data, wait a moment, then Load again.
+> 3. **Rely on auto-save** — saving after a successful load "rebases" the anchor, so subsequent loads from the same session are more reliable.
+>
+> The underlying cause is that MRUK's spatial anchor can take a variable amount of time to converge to its true pose after `SceneLoadedEvent` fires. The existing stabilization loop (5 stable frames within ~1 second) handles most cases but may not be sufficient in all environments.
+
 ### Architecture
 
 ```

@@ -52,6 +52,7 @@ namespace Genesis.RoomScan.Editor
         PanelInputConfiguration _panelInputConfig;
 
         bool _depthCaptureWired, _volumeWired, _meshMatWired, _triplanarWired, _computeShaderWired;
+        bool _refinedShaderWired, _atlasBakeComputeWired;
         bool _ugsRendererWired;
         bool _ugsRenderFeatureAdded;
         bool _deferredRendering;
@@ -144,6 +145,10 @@ namespace Genesis.RoomScan.Editor
                 "bakeCompute");
             _computeShaderWired = _meshExtractor != null && AreFieldsAssigned(_meshExtractor,
                 "surfaceNetsCompute");
+            _refinedShaderWired = _roomScanner != null && AreFieldsAssigned(_roomScanner,
+                "refinedMeshShader");
+            _atlasBakeComputeWired = _roomScanner != null && AreFieldsAssigned(_roomScanner,
+                "atlasBakeCompute");
             _ugsRendererWired = _ugsRenderer != null && AreFieldsAssigned(_ugsRenderer,
                 "m_ShaderSplats", "m_ShaderComposite", "m_ShaderDebugPoints", "m_ShaderDebugBoxes", "m_CSSplatUtilities");
             _ugsRenderFeatureAdded = HasUGSRenderFeature();
@@ -152,6 +157,29 @@ namespace Genesis.RoomScan.Editor
             _boundarylessManifest = ManifestHasBoundaryless();
             _cleartextAllowed = ManifestHasCleartextTraffic();
             _insecureHttpAllowed = PlayerSettings.insecureHttpOption != InsecureHttpOption.NotAllowed;
+
+            RefreshServerUrl();
+        }
+
+        bool _serverUrlCurrent;
+        string _detectedLanIp;
+        string _currentServerUrl;
+
+        void RefreshServerUrl()
+        {
+            _serverUrlCurrent = false;
+            _detectedLanIp = GetLanIp();
+            _currentServerUrl = null;
+
+            if (_gsplatServerClient == null || string.IsNullOrEmpty(_detectedLanIp)) return;
+
+            var so = new SerializedObject(_gsplatServerClient);
+            var prop = so.FindProperty("serverUrl");
+            if (prop == null) return;
+
+            _currentServerUrl = prop.stringValue;
+            string expected = $"http://{_detectedLanIp}:8420";
+            _serverUrlCurrent = _currentServerUrl == expected;
         }
 
         // =================================================================
@@ -168,6 +196,7 @@ namespace Genesis.RoomScan.Editor
             DrawProjectSettings();
             DrawComponents();
             DrawShaderWiring();
+            DrawNativePlugins();
 
             GUILayout.Space(12);
             DrawMasterButton();
@@ -502,7 +531,20 @@ namespace Genesis.RoomScan.Editor
             StatusRow("VolumeIntegrator", _volumeIntegrator != null);
             StatusRow("MeshExtractor", _meshExtractor != null);
             StatusRow("RoomScanner", _roomScanner != null);
-            StatusRow("RoomAnchorManager (MRUK volume anchor)", _roomAnchor != null);
+            StatusRow("RoomAnchorManager (MRUK + SpatialAnchor)", _roomAnchor != null);
+
+            var ovrConfig = OVRProjectConfig.CachedProjectConfig;
+            bool anchorSupportOk = ovrConfig != null
+                && ovrConfig.anchorSupport != OVRProjectConfig.AnchorSupport.Disabled;
+            StatusRow("OVRProjectConfig anchor support", anchorSupportOk);
+            if (!anchorSupportOk && ovrConfig != null)
+            {
+                if (GUILayout.Button("Fix: Enable Spatial Anchor Support"))
+                {
+                    ovrConfig.anchorSupport = OVRProjectConfig.AnchorSupport.Enabled;
+                    OVRProjectConfig.CommitProjectConfig(ovrConfig);
+                }
+            }
             StatusRow("PassthroughCameraProvider", _cameraProvider != null);
             StatusRow("PassthroughCameraAccess", _pcaComponent != null);
             StatusRow("CameraDebugOverlay", _cameraDebug != null);
@@ -514,6 +556,23 @@ namespace Genesis.RoomScan.Editor
             StatusRow("GSplatManager (PLY loader)", _gsplatManager != null);
             StatusRow("GaussianSplatRenderer (UGS)", _ugsRenderer != null);
             StatusRow("GSplatServerClient (PC training)", _gsplatServerClient != null);
+            if (_gsplatServerClient != null)
+            {
+                if (_serverUrlCurrent)
+                {
+                    StatusRow($"  Server URL → {_detectedLanIp}:8420", true);
+                }
+                else
+                {
+                    string stale = string.IsNullOrEmpty(_currentServerUrl) ? "(empty)" : _currentServerUrl;
+                    StatusRow($"  Server URL STALE: {stale} (LAN: {_detectedLanIp})", false);
+                    if (GUILayout.Button("Fix Server URL"))
+                    {
+                        ConfigureServerUrl();
+                        Refresh();
+                    }
+                }
+            }
             StatusRow("DebugMenuController (HUD)", _debugMenu != null);
             StatusRow("RoomScanInputHandler (bindings)", _inputHandler != null);
             StatusRow("EventSystem + OVRInputModule", _eventSystem != null && _ovrInputModule != null);
@@ -696,13 +755,16 @@ namespace Genesis.RoomScan.Editor
             StatusRow("MeshExtractor scan material", _meshMatWired);
             StatusRow("TriplanarCache bake compute", _triplanarWired);
             StatusRow("SurfaceNetsExtract compute shader", _computeShaderWired);
+            StatusRow("RefinedMesh shader (texture refine)", _refinedShaderWired);
+            StatusRow("AtlasBakeCompute (GPU bake)", _atlasBakeComputeWired);
             StatusRow("UGS renderer shaders + compute", _ugsRendererWired);
             StatusRow("UGS RenderFeature on URP Renderer", _ugsRenderFeatureAdded);
             StatusRow("URP Deferred Rendering (req. by UGS)", _deferredRendering);
 
             bool needsFix = !_depthCaptureWired || !_volumeWired ||
                             !_meshMatWired || !_triplanarWired ||
-                            !_computeShaderWired ||
+                            !_computeShaderWired || !_refinedShaderWired ||
+                            !_atlasBakeComputeWired ||
                             !_ugsRendererWired || !_ugsRenderFeatureAdded ||
                             !_deferredRendering;
             if (needsFix)
@@ -771,6 +833,16 @@ namespace Genesis.RoomScan.Editor
                 AssignCompute(so, "surfaceNetsCompute", PKG + "SurfaceNetsExtract.compute");
                 so.ApplyModifiedProperties();
                 EditorUtility.SetDirty(_meshExtractor);
+            }
+
+            // RoomScanner — refined mesh + atlas bake shaders
+            if (_roomScanner != null)
+            {
+                var so = new SerializedObject(_roomScanner);
+                AssignAsset<Shader>(so, "refinedMeshShader", PKG + "RefinedMesh.shader");
+                AssignAsset<ComputeShader>(so, "atlasBakeCompute", PKG + "AtlasBakeCompute.compute");
+                so.ApplyModifiedProperties();
+                EditorUtility.SetDirty(_roomScanner);
             }
 
             // UGS GaussianSplatRenderer — shaders + compute
@@ -967,6 +1039,264 @@ namespace Genesis.RoomScan.Editor
             Debug.Log("[RoomScan Setup] Added GaussianSplatURPFeature to URP Renderer");
         }
 
+        // -- Native Plugins -----------------------------------------------
+
+        bool _xatlasAndroid, _xatlasMacOS;
+
+        void RefreshNativePlugins()
+        {
+            string pkgRoot = "Packages/com.genesis.roomscan/Runtime";
+            _xatlasAndroid = System.IO.File.Exists(
+                Path.GetFullPath(Path.Combine(pkgRoot, "Plugins/Android/libxatlas.so")));
+            _xatlasMacOS = System.IO.File.Exists(
+                Path.GetFullPath(Path.Combine(pkgRoot, "Plugins/macOS/libxatlas.bundle")));
+        }
+
+        void DrawNativePlugins()
+        {
+            RefreshNativePlugins();
+            BeginSection("NATIVE PLUGINS");
+            StatusRow("xatlas (Android ARM64)", _xatlasAndroid);
+            StatusRow("xatlas (macOS Editor)", _xatlasMacOS);
+
+            if (!_xatlasAndroid || !_xatlasMacOS)
+            {
+                GUILayout.Space(2);
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Build xatlas Plugin", GUILayout.Width(200)))
+                    BuildXAtlasPlugin();
+                EditorGUILayout.EndHorizontal();
+            }
+            EndSection();
+        }
+
+        static void BuildXAtlasPlugin()
+        {
+            string pkgRoot = Path.GetFullPath("Packages/com.genesis.roomscan/Runtime");
+            string srcDir = Path.Combine(pkgRoot, "Native/xatlas");
+            string srcApi = Path.Combine(srcDir, "xatlas_c_api.cpp");
+            string srcImpl = Path.Combine(srcDir, "xatlas.cpp");
+            string meshoptDir = Path.Combine(pkgRoot, "Native/meshoptimizer");
+            string srcSimplifier = Path.Combine(meshoptDir, "simplifier.cpp");
+
+            if (!System.IO.File.Exists(srcApi) || !System.IO.File.Exists(srcImpl))
+            {
+                EditorUtility.DisplayDialog("Build xatlas",
+                    $"Source files not found in:\n{srcDir}\n\nExpected xatlas.cpp and xatlas_c_api.cpp",
+                    "OK");
+                return;
+            }
+
+            bool hasMeshopt = System.IO.File.Exists(srcSimplifier);
+            if (!hasMeshopt)
+                Debug.LogWarning("[RoomScan Setup] meshoptimizer sources not found — building without mesh simplification");
+
+            string meshoptSrc = hasMeshopt ? $" \"{srcSimplifier}\"" : "";
+            string meshoptInc = hasMeshopt ? $" -I\"{meshoptDir}\"" : "";
+
+            var builds = new System.Collections.Generic.List<(string label, string exe, string args, string outAssetPath)>();
+
+            // macOS
+            {
+                string outDir = Path.Combine(pkgRoot, "Plugins/macOS");
+                Directory.CreateDirectory(outDir);
+                string outPath = Path.Combine(outDir, "libxatlas.bundle");
+                string bArgs = $"-shared -O2 -fPIC -std=c++11 -fvisibility=hidden{meshoptInc} " +
+                               $"-o \"{outPath}\" \"{srcApi}\" \"{srcImpl}\"{meshoptSrc}";
+                builds.Add(("macOS xatlas", "clang++", bArgs,
+                    "Packages/com.genesis.roomscan/Runtime/Plugins/macOS/libxatlas.bundle"));
+            }
+
+            // Android ARM64
+#if UNITY_EDITOR_OSX || UNITY_EDITOR_LINUX || UNITY_EDITOR_WIN
+            {
+                string ndkClang = FindNdkClang();
+                if (ndkClang != null)
+                {
+                    string outDir = Path.Combine(pkgRoot, "Plugins/Android");
+                    Directory.CreateDirectory(outDir);
+                    string outPath = Path.Combine(outDir, "libxatlas.so");
+                    string bArgs = $"-shared -O2 -fPIC -std=c++11 -fvisibility=hidden{meshoptInc} " +
+                                   $"-o \"{outPath}\" \"{srcApi}\" \"{srcImpl}\"{meshoptSrc}";
+                    builds.Add(("Android xatlas", ndkClang, bArgs,
+                        "Packages/com.genesis.roomscan/Runtime/Plugins/Android/libxatlas.so"));
+                }
+            }
+#endif
+
+            if (builds.Count == 0)
+            {
+                Debug.LogError("[RoomScan Setup] No build targets available");
+                return;
+            }
+
+            StartAsyncBuilds(builds);
+        }
+
+        static string FindNdkClang()
+        {
+            string ndkPath = null;
+            try
+            {
+                ndkPath = UnityEditor.Android.AndroidExternalToolsSettings.ndkRootPath;
+            }
+            catch
+            {
+                Debug.LogWarning("[RoomScan Setup] Android NDK path not configured. Skipping Android build.");
+                return null;
+            }
+
+            if (string.IsNullOrEmpty(ndkPath) || !Directory.Exists(ndkPath))
+            {
+                Debug.LogWarning($"[RoomScan Setup] NDK not found at: {ndkPath}");
+                return null;
+            }
+
+            string prebuilt = Path.Combine(ndkPath, "toolchains/llvm/prebuilt");
+            if (!Directory.Exists(prebuilt)) return null;
+
+            string[] hosts = Directory.GetDirectories(prebuilt);
+            if (hosts.Length == 0) return null;
+
+            string clangpp = Path.Combine(hosts[0], "bin/aarch64-linux-android31-clang++");
+            return System.IO.File.Exists(clangpp) ? clangpp : null;
+        }
+
+        // Async build state
+        static System.Collections.Generic.List<(string label, System.Diagnostics.Process proc, string outAssetPath,
+            System.Text.StringBuilder stdout, System.Text.StringBuilder stderr)> _activeBuilds;
+        static int _totalBuilds;
+
+        static void StartAsyncBuilds(
+            System.Collections.Generic.List<(string label, string exe, string args, string outAssetPath)> builds)
+        {
+            _activeBuilds = new();
+            _totalBuilds = builds.Count;
+
+            foreach (var (label, exe, args, outAssetPath) in builds)
+            {
+                try
+                {
+                    var psi = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = exe,
+                        Arguments = args,
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    };
+
+                    var proc = System.Diagnostics.Process.Start(psi);
+                    var stdoutBuf = new System.Text.StringBuilder();
+                    var stderrBuf = new System.Text.StringBuilder();
+                    proc.OutputDataReceived += (_, e) => { if (e.Data != null) stdoutBuf.AppendLine(e.Data); };
+                    proc.ErrorDataReceived += (_, e) => { if (e.Data != null) stderrBuf.AppendLine(e.Data); };
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+                    _activeBuilds.Add((label, proc, outAssetPath, stdoutBuf, stderrBuf));
+                }
+                catch (System.Exception e)
+                {
+                    Debug.LogError($"[RoomScan Setup] Failed to start {label}: {e.Message}");
+                }
+            }
+
+            if (_activeBuilds.Count == 0)
+            {
+                Debug.LogError("[RoomScan Setup] No builds started");
+                return;
+            }
+
+            EditorApplication.update += PollXAtlasBuilds;
+            EditorUtility.DisplayProgressBar("Building xatlas", "Compiling native plugins...", 0f);
+        }
+
+        static void PollXAtlasBuilds()
+        {
+            if (_activeBuilds == null) return;
+
+            int done = 0;
+            foreach (var (label, proc, _, _, _) in _activeBuilds)
+                if (proc.HasExited) done++;
+
+            float progress = (float)done / _totalBuilds;
+            string building = done < _totalBuilds
+                ? $"Compiling... ({done}/{_totalBuilds} done)"
+                : "Finishing...";
+            EditorUtility.DisplayProgressBar("Building xatlas", building, progress);
+
+            if (done < _totalBuilds) return;
+
+            // All done
+            EditorApplication.update -= PollXAtlasBuilds;
+            EditorUtility.ClearProgressBar();
+
+            bool allOk = true;
+            var results = new System.Text.StringBuilder();
+
+            foreach (var (label, proc, outAssetPath, _, stderrBuf) in _activeBuilds)
+            {
+                string stderr = stderrBuf.ToString();
+                bool ok = proc.ExitCode == 0;
+                allOk &= ok;
+                results.AppendLine($"  {label}: {(ok ? "OK" : $"FAILED (exit {proc.ExitCode})")}");
+
+                if (!ok)
+                    Debug.LogError($"[RoomScan Setup] {label} build failed (exit {proc.ExitCode}):\n{stderr}");
+                else if (!string.IsNullOrWhiteSpace(stderr))
+                    Debug.LogWarning($"[RoomScan Setup] {label} warnings:\n{stderr}");
+                else
+                    Debug.Log($"[RoomScan Setup] {label} build succeeded");
+
+                proc.Dispose();
+            }
+
+            AssetDatabase.Refresh();
+
+            // Configure plugin importers after AssetDatabase sees the new files
+            EditorApplication.delayCall += () =>
+            {
+                foreach (var (label, _, outAssetPath, _, _) in _activeBuilds)
+                    ConfigurePluginImporter(outAssetPath);
+                _activeBuilds = null;
+            };
+
+            if (allOk)
+                Debug.Log($"[RoomScan Setup] xatlas build complete:\n{results}");
+        }
+
+        static void ConfigurePluginImporter(string assetPath)
+        {
+            var importer = AssetImporter.GetAtPath(assetPath) as PluginImporter;
+            if (importer == null)
+            {
+                Debug.LogWarning($"[RoomScan Setup] PluginImporter not found for {assetPath}");
+                return;
+            }
+
+            bool isAndroid = assetPath.Contains("/Android/");
+
+            importer.SetCompatibleWithAnyPlatform(false);
+            importer.SetCompatibleWithEditor(!isAndroid);
+            importer.SetCompatibleWithPlatform(BuildTarget.Android, isAndroid);
+            importer.SetCompatibleWithPlatform(BuildTarget.StandaloneOSX, !isAndroid);
+
+            if (isAndroid)
+                importer.SetPlatformData(BuildTarget.Android, "CPU", "ARM64");
+
+            if (!isAndroid)
+            {
+                importer.SetEditorData("CPU", "AnyCPU");
+                importer.SetEditorData("OS", "OSX");
+            }
+
+            importer.SaveAndReimport();
+            Debug.Log($"[RoomScan Setup] Configured plugin importer: {assetPath}" +
+                      (isAndroid ? " (Android ARM64)" : " (macOS Editor)"));
+        }
+
         // -- Master Button ------------------------------------------------
 
         void DrawMasterButton()
@@ -1006,13 +1336,15 @@ namespace Genesis.RoomScan.Editor
             FixComponents();
             FixShaderWiring();
 
-            // RoomScanner and GSplatManager resolve siblings via GetComponent —
-            // no serialized wiring needed.
+            RefreshNativePlugins();
+            if (!_xatlasAndroid || !_xatlasMacOS)
+                BuildXAtlasPlugin();
 
             MarkDirty();
             Refresh();
 
-            Debug.Log("[RoomScan Setup] Scene setup complete.");
+            Debug.Log("[RoomScan Setup] Scene setup complete." +
+                (!_xatlasAndroid || !_xatlasMacOS ? " (xatlas build running in background)" : ""));
         }
 
         // =================================================================

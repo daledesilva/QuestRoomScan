@@ -5,7 +5,9 @@
 Real-time 3D room reconstruction on Quest 3 using a TSDF (Truncated Signed Distance Field) volume and fully GPU-driven Surface Nets mesh extraction.
 
 ```
-RoomAnchorManager (MRUK floor anchor → relocation matrix on load)
+RoomAnchorManager (OVRSpatialAnchor persistence + MRUK fallback → per-artifact relocation)
+       │
+RoomScanPersistence (package-based multi-scan persistence, anchor.json, manifest.json)
        │
 DepthCapture (AR depth frames → normals → dilation, tracking→world conversion)
        │
@@ -275,37 +277,78 @@ Temporal blending on the GPU provides implicit convergence-based stability (see 
 
 ## 9. Persistence
 
-`RoomScanPersistence` saves/loads the full scan state to disk.
+`RoomScanPersistence` manages a **package-based multi-scan persistence system**. Each scan is a self-contained package with all its artifacts.
 
-### Binary Format (`RMSH` v1)
+### Package Layout
+```
+{persistentDataPath}/RoomScans/
+  manifest.json                    # Global index of all packages
+  pkg_20260228_143022/
+    scan.bin                       # TSDF + color volumes (RMSH v1 binary)
+    anchor.json                    # OVRSpatialAnchor UUID + per-artifact matrices
+    triplanar/                     # 6 raw files (3 color + 3 depth)
+    keyframes/                     # Copied from GSExport/ (images/*.jpg + frames.jsonl)
+    splat.ply                      # Auto-saved when GS training completes
+    refined_mesh.bin               # Auto-saved when refinement completes
+    refined_atlas.raw              # On-device refined atlas (RGBA32)
+    hq_atlas.raw                   # Server-side HQ refined atlas (RGBA32)
+```
+
+### anchor.json — Per-Artifact Creation Matrices
+```json
+{
+  "anchorUuid": "abc-123-...",
+  "baseMatrixAtSave": [16 floats],
+  "splatMatrixAtCreate": [16 floats or null],
+  "refinedMatrixAtCreate": [16 floats or null],
+  "hqMatrixAtCreate": [16 floats or null]
+}
+```
+All matrices are from localizing the **same** OVRSpatialAnchor (same UUID) in different sessions. Each artifact records the anchor's `localToWorldMatrix` at the time the artifact was created/saved. On load, the anchor is localized to get `M_now`, and per-artifact relocation matrices are computed:
+- `R_volume = M_now × baseMatrixAtSave^-1` → BakeRelocation on TSDF + triplanar
+- `R_splat = M_now × splatMatrixAtCreate^-1` → SplatHolder transform
+- `R_refined = M_now × refinedMatrixAtCreate^-1` → refined mesh vertex MultiplyPoint3x4 + normal MultiplyVector
+
+This allows artifacts created in different sessions (scan in session 1, splat in session 2, refine in session 3) to be correctly relocated when loaded in session 4.
+
+### Binary Format (`RMSH` v1, unchanged)
 ```
 Header:  magic (RMSH) | version (1) | timestamp (int64)
 Params:  voxelCount (int3) | voxelSize (float) | integrationCount (int) | triplanarRes (int)
-Anchor:  anchorAtSave (Matrix4x4, 16 floats — MRUK floor anchor localToWorld at save time)
+Anchor:  anchorAtSave (Matrix4x4, 16 floats — kept for backward compat)
 TSDF:    length (int) | raw bytes (RG8_SNorm)
 Color:   length (int) | raw bytes (RGBA8_UNorm)
 ```
 Triplanar data saved separately as 6 raw files: `tri_xz.raw`, `tri_xy.raw`, `tri_yz.raw` (RGBA8 color) + `depth_xz.raw`, `depth_xy.raw`, `depth_yz.raw` (R8 depth).
 
-### Save Pipeline
-1. `AsyncGPUReadback` full TSDF volume (slice-by-slice copy)
-2. `AsyncGPUReadback` full color volume
-3. `TriplanarCache` saves 3 color textures + 3 depth textures as raw files
-4. `RoomAnchorManager.GetRoomLocalToWorldForPersistence()` captures the current MRUK floor anchor pose
-5. `BinaryWriter` writes header + anchor matrix + volume bytes to `persistentDataPath/RoomScans/scan.bin`
-6. Triggered by: `OnApplicationPause`, `OnApplicationQuit`, or manual call
+### Save Pipeline (`SaveToNewPackageAsync`)
+1. Generate `pkg_{timestamp}` directory
+2. `AsyncGPUReadback` full TSDF + color volumes (slice-by-slice)
+3. `RoomAnchorManager.CreateAndSaveSpatialAnchorAsync()` at MRUK floor position → persisted `OVRSpatialAnchor`
+4. Write `scan.bin` (same v1 format) with anchor matrix
+5. Write `anchor.json` with UUID + `baseMatrixAtSave`
+6. Save triplanar textures + depth maps
+7. Copy `GSExport/` contents to `keyframes/`
+8. Update `manifest.json`
+9. Set as `ActivePackageId` — subsequent artifact saves go here automatically
 
-### Load Pipeline
-1. Read binary, validate magic/version (must be exactly v1)/voxel dimensions
-2. Create `Texture3D`, `SetPixelData`, `Graphics.CopyTexture` to upload TSDF and color to GPU
-3. Wait for MRUK room to load (polling loop, ~5s timeout) — required before computing relocation
-4. Compute relocation matrix `R = A_now × Inv(A_save)` via `RoomAnchorManager`
-5. If `R ≠ I` (room anchor moved):
-   - `VolumeIntegrator.BakeRelocation(R)` — compute shader resamples TSDF + color into the current frame (see §9b)
-   - `TriplanarCache.BakeRelocation(R, dir)` — forward-splat compute relocation of triplanar textures (see §9c)
-6. If `R = I` (same anchor pose): load triplanar color + depth textures directly from raw files
-7. `MeshExtractor.Reinitialize()` + `Extract()` — rebuild GPU mesh from relocated volume
-8. Resume scanning (new observations refine the loaded mesh)
+### Artifact Auto-Save (`SaveArtifactAsync`)
+Called automatically when: splat download completes, on-device refinement finishes, HQ refinement finishes.
+1. Write artifact file(s) to active package directory
+2. Record current anchor localization matrix as `*MatrixAtCreate` in `anchor.json`
+3. Update manifest flags
+
+### Load Pipeline (`LoadPackageAsync`)
+1. Read `scan.bin` + `anchor.json` in background
+2. Validate voxel grid compatibility
+3. Upload TSDF + color to GPU
+4. Localize spatial anchor: `RoomAnchorManager.LoadSpatialAnchorAsync(uuid)` → `M_now`
+5. If spatial anchor fails, fall back to MRUK floor anchor (with stabilization polling)
+6. Compute per-artifact relocation matrices from `anchor.json`
+7. `BakeRelocation(R_volume)` on TSDF volume + triplanar
+8. Load splat with `R_splat` applied to `SplatHolder` transform
+9. Load refined mesh with `R_refined` applied to vertex positions and normals
+10. Rebuild GPU mesh from relocated volume
 
 ### 9b. TSDF Volume Bake Relocation (`BakeRelocation` kernel)
 
@@ -370,19 +413,34 @@ ForwardSplatRelocation(uint2 id):
 
 ## 10. Room Anchoring
 
-`RoomAnchorManager` uses Meta's MR Utility Kit (MRUK) to anchor the scan to the physical room across sessions and tracking recenters.
+`RoomAnchorManager` provides two anchoring mechanisms:
 
-### MRUK Floor Anchor
-On startup, `RoomAnchorManager` loads the device's scene model via `MRUK.LoadSceneFromDevice()` and grabs the first floor anchor's `localToWorldMatrix`. This transform is stable across tracking recenters because MRUK world-locks the scene mesh to the room.
+### OVRSpatialAnchor (Primary — Persistence)
+The primary cross-session relocation mechanism uses Meta's `OVRSpatialAnchor` API:
+- **Create**: At save time, a spatial anchor is created at the MRUK floor position, persisted to device storage via `SaveAnchorAsync()`. The anchor's UUID and `localToWorldMatrix` are stored in `anchor.json`.
+- **Load**: At load time, the anchor is loaded via `LoadUnboundAnchorsAsync()` and localized via `LocalizeAsync()`. The localized anchor's `localToWorldMatrix` provides `M_now` for computing relocation.
+- **Erase**: When a package is deleted, the spatial anchor is erased from persistent storage via `EraseAnchorsAsync()`.
+- **Transform stabilization**: After creation or localization, the anchor transform is polled for 5 consecutive frames with < 1mm movement before reading the matrix (prevents jitter from ongoing SLAM refinement).
 
-### Relocation Matrix
-When loading a saved scan, the relocation matrix `R = A_now × Inv(A_save)` encodes the rigid transform between the anchor's pose at save time and its pose at load time. If the user hasn't moved or the tracking origin is unchanged, `R = I` and no relocation is needed.
+### MRUK Floor Anchor (Fallback — Runtime)
+On startup, `RoomAnchorManager` loads the device's scene model via `MRUK.LoadSceneFromDevice()` and grabs the first floor anchor's `localToWorldMatrix`. This serves two purposes:
+1. **Runtime world-locking**: MRUK world-locks the scene mesh to the room, providing stable camera-to-world conversion
+2. **Fallback**: If spatial anchor localization fails (e.g., device storage cleared, major room changes), the MRUK floor anchor is used for relocation instead
+
+### Per-Artifact Relocation
+Artifacts created in different sessions (scan in session 1, splat in session 2, refined mesh in session 3) each record the spatial anchor's `localToWorldMatrix` at creation time. On load in session 4:
+```
+R_volume  = M_now × baseMatrixAtSave^-1
+R_splat   = M_now × splatMatrixAtCreate^-1
+R_refined = M_now × refinedMatrixAtCreate^-1
+```
+If an artifact's creation matrix is null (legacy data), it falls back to `baseMatrixAtSave`. Raw artifact files are never rewritten — each stays in the coordinate space it was created in.
 
 ### Tracking-Space to World-Space Conversion
-MRUK's world-lock can reposition the `TrackingSpace` transform (parent of the XR cameras) each frame. All camera poses from the depth and passthrough systems are reported in tracking space. `DepthCapture.TrackingToWorld(Pose)` converts these to world space via `TrackingSpace.TransformPoint` / `TrackingSpace.rotation` before passing them to `VolumeIntegrator`, `TriplanarCache`, and `KeyframeCollector`. Without this, depth integration and triplanar baking would use stale coordinates whenever MRUK repositions the tracking origin.
+MRUK's world-lock can reposition the `TrackingSpace` transform each frame. `DepthCapture.TrackingToWorld(Pose)` converts camera poses from tracking space to world space before passing them to `VolumeIntegrator`, `TriplanarCache`, and `KeyframeCollector`.
 
 ### Startup Sequence
-`RoomScanner.Start()` waits for `RoomAnchorManager.RoomReady` before beginning scanning or loading saved data. This prevents a race where loading a scan before the anchor is resolved would skip relocation.
+`RoomScanner.Start()` waits for `RoomAnchorManager.RoomReady` before beginning scanning or loading saved data.
 
 ## 11. Exclusion Zones
 
@@ -472,10 +530,12 @@ Voxels inside any exclusion cylinder are skipped during integration, preventing 
 ### Room Anchoring & Relocation
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `RoomAnchorManager` | enabled | Disable to skip MRUK anchoring (identity volume placement) |
+| `RoomAnchorManager` | enabled | Disable to skip MRUK + spatial anchor (identity volume placement) |
 | `saveOnQuit` | false | Auto-save scan on application quit |
 | Relocation dilation passes | 4 | Compute dilation passes after forward-splat (fills coverage gaps) |
-| MRUK room load timeout | ~5s | Max wait for MRUK scene before proceeding without relocation |
+| Spatial anchor creation timeout | 5s | Max wait for `OVRSpatialAnchor.Created` |
+| Spatial anchor localize timeout | 10s | Max wait for `LocalizeAsync` completion |
+| Transform stabilization | 5 frames, < 1mm | Stable consecutive frames before reading anchor matrix |
 
 ### Memory Budget (Quest 3)
 | Component | Memory |
@@ -596,3 +656,86 @@ Unity uses left-handed Y-up; COLMAP uses right-handed Y-down. The full round-tri
 **Server → Quest (denormalized PLY)**:
 - PLY is in COLMAP world coordinates (Y-down)
 - `GaussianSplatPlyLoader` negates Y position during loading to convert back to Unity space
+
+## 14. Texture Refinement Pipeline
+
+Post-processing pipeline that produces a sharp UV-mapped texture atlas from saved keyframes, replacing the blurry triplanar vertex-color texturing. Uses the same keyframes collected for Gaussian Splat training (§13.1).
+
+### 14.1 Mesh Simplification (optional, meshoptimizer)
+
+Before UV unwrapping, the GPU Surface Nets mesh can be optionally decimated using [meshoptimizer](https://github.com/zeux/meshoptimizer) v1.0 (`meshopt_simplify`):
+
+- **Input**: Original mesh positions + index buffer from GPU readback
+- **Operation**: Quadric error metric simplification — removes triangles while preserving mesh topology and surface shape. Only the index buffer changes; vertex positions are untouched.
+- **Target**: Configurable ratio (default 0.5 = 50% triangle reduction). Inspector slider `decimationRatio ∈ [0.1, 1.0]`.
+- **Performance**: <5ms even for 100k triangles on ARM64
+- **Purpose**: Reduces xatlas charting/packing time roughly proportionally to triangle reduction. Since the atlas resolution (2048²) is the detail bottleneck — not mesh density — moderate decimation has negligible visual impact on the baked texture.
+
+### 14.2 UV Unwrapping (xatlas)
+
+[xatlas](https://github.com/jpcy/xatlas) generates a UV atlas via native C++ P/Invoke:
+
+```
+Create atlas → AddMesh(positions, normals, indices) → Generate(chartOpts, packOpts) → read output
+```
+
+**Charting phase** segments the mesh into charts (connected patches with low angular distortion):
+- `maxCost` (default 1.5, xatlas default 2.0): Chart growth cost threshold. Lower = more, smaller charts = faster parameterization at the cost of more seams.
+- `normalDeviationWeight`, `straightnessWeight`, `normalSeamWeight`: Control chart boundary placement relative to surface curvature and existing seams.
+- `maxIterations` = 1: Single pass (minimum).
+
+**Packing phase** arranges charts into the atlas texture:
+- `resolution` (default 2048): Atlas resolution in pixels.
+- `blockAlign` (default true, xatlas default false): Aligns charts to 4×4 pixel blocks. Dramatically reduces packing search space at slight atlas utilization cost.
+- `padding` = 2: Pixels between charts to prevent bleeding during bilinear filtering.
+- `bilinear` = true: Reserves extra space for bilinear filter sampling.
+
+**Output**: New vertex buffer (split at UV seams), UV coordinates in atlas-pixel space, index buffer, and xref array mapping each output vertex back to the original mesh vertex.
+
+All xatlas options are exposed through a flat C API (`xatlas_generate_opts`) and configurable from the Inspector via `UnwrapOptions`.
+
+### 14.3 GPU Atlas Baking (Compute Shader)
+
+`AtlasBakeCompute.compute` processes each keyframe to project camera imagery onto the UV atlas. All data is in `StructuredBuffer`s with integer pixel indexing — no render targets, no Y-axis ambiguity.
+
+**Three kernels, dispatched per keyframe:**
+
+1. **ClearDepth** (`[numthreads(256,1,1)]`): Fills depth buffer with 999 (far sentinel). One dispatch per keyframe to reset occlusion.
+
+2. **BuildDepth** (`[numthreads(64,1,1)]`): Per original-mesh triangle, rasterizes in screen space using the keyframe's view/projection. Writes `InterlockedMin(asuint(z))` to build an occlusion depth map. This uses the *original* (pre-decimation) mesh to ensure accurate occlusion.
+
+3. **BakeAtlas** (`[numthreads(64,1,1)]`): Per UV-unwrapped triangle:
+   - Rasterizes bounding box in atlas UV space
+   - Barycentric test for point-in-triangle
+   - Interpolates 3D world position from barycentrics
+   - Projects to keyframe screen space via intrinsics (fx, fy, cx, cy with crop offset)
+   - **Bounds check**: Discards if outside image
+   - **Occlusion check**: Compares projected depth against depth buffer (with 0.05 tolerance)
+   - **Score**: `dot(surfaceNormal, viewDirection)` — prefers head-on views
+   - **Atomic best-score selection**: `InterlockedMax(_ScoreBuf[texelIdx], asuint(score))` — since scores are positive floats, `asuint()` preserves ordering. Color is written only when the thread wins the comparison.
+
+**Keyframe processing** is sequential from C#: decode JPEG → `GetPixels32()` → upload to `ComputeBuffer` → dispatch 3 kernels → `await Task.Yield()`. Score and atlas buffers persist across keyframes (best score accumulates).
+
+**Post-processing** (CPU):
+- **Dilation**: Fills empty texels at UV island edges by averaging non-empty neighbors (multiple passes)
+- **Denoise** (optional, `skipDenoise` toggle): Median-like filter to remove speckle noise from misaligned projections. GPU compute bake produces fewer speckles than CPU bake, so this is off by default.
+
+**CPU fallback**: `BakeAtlasCPUAsync` implements identical logic in C# with `unsafe` pointer access. Used when compute shader is null (`forceCpuBake` toggle).
+
+### 14.4 Render Modes
+
+Two additional render modes after refinement:
+
+- **Refined**: On-device atlas applied to a `Mesh` object with `RefinedMesh.shader` (standard unlit UV-mapped rendering). Available immediately after on-device refinement.
+- **HQRefined**: Server-refined atlas (same mesh, different texture). Available after server-side differentiable refinement. **Currently broken** — on-device refinement is recommended.
+
+Both atlases and mesh data persist to disk via `RoomScanPersistence` and survive app restarts / scan reloads.
+
+### 14.5 Server-Side HQ Refinement (experimental, currently broken)
+
+Optional server-side path using differentiable rendering for texture optimization:
+1. Client uploads UV mesh binary (`refined_mesh.bin`) + keyframe ZIP to `gs-server`
+2. Server computes UV-to-pixel correspondences and runs gradient-based texture optimization
+3. Client polls `/refine-texture/status`, downloads result atlas
+
+Uses pure PyTorch tensor operations (no nvdiffrast), supporting MPS (Metal), CUDA, and CPU backends. This path is currently non-functional and is not recommended for use.

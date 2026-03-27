@@ -10,6 +10,8 @@ Real-time 3D room reconstruction on Meta Quest 3. Produces a textured mesh from 
 |:---:|:---:|
 | ![Refined](docs/refined3.gif) | ![Splat](docs/splat.gif) |
 
+**[Full demo video](https://www.youtube.com/watch?v=lEn3GkH7Yao)** — recorded before multi-view blending, GPU sharpening, and atlas enhancement were added; current output quality is noticeably better.
+
 ## Features
 
 - **GPU TSDF Integration** — Depth frames fused into a signed distance field via compute shaders

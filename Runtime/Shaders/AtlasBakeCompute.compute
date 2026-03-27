@@ -1,6 +1,10 @@
 #pragma kernel ClearDepth
 #pragma kernel BuildDepth
 #pragma kernel BakeAtlas
+#pragma kernel BlendSeams
+#pragma kernel BlendAccum
+#pragma kernel ResolveBlend
+#pragma kernel SharpenAtlas
 
 // ── Shared uniforms ──────────────────────────────────────────
 float4x4 _ViewMat;
@@ -205,4 +209,303 @@ void BakeAtlas(uint3 id : SV_DispatchThreadID)
             _AtlasBuf[texelIdx] = kfColor | (255u << 24);
         }
     }
+}
+
+// ═════════════════════════════════════════════════════════════
+//  Kernel 3: Seam blending — gaussian-weighted averaging at UV
+//  island boundaries. Detects boundary texels (filled texel
+//  adjacent to texels from a different UV island or unfilled)
+//  and blends them with nearby filled neighbors.
+// ═════════════════════════════════════════════════════════════
+
+RWStructuredBuffer<uint> _AtlasBufSrc;  // snapshot copy (read-only during blend)
+int _BlendRadius;
+
+[numthreads(8, 8, 1)]
+void BlendSeams(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _AtlasW || (int)id.y >= _AtlasH) return;
+
+    int idx = (int)id.y * _AtlasW + (int)id.x;
+    uint centerPacked = _AtlasBufSrc[idx];
+    uint centerA = (centerPacked >> 24) & 0xFF;
+    if (centerA == 0) return;  // unfilled texel, skip
+
+    // Check if this texel is near a UV island boundary:
+    // a filled texel that has at least one unfilled neighbor within 1 pixel
+    bool nearBoundary = false;
+    for (int dy = -1; dy <= 1 && !nearBoundary; dy++)
+    {
+        for (int dx = -1; dx <= 1 && !nearBoundary; dx++)
+        {
+            if (dx == 0 && dy == 0) continue;
+            int nx = (int)id.x + dx;
+            int ny = (int)id.y + dy;
+            if (nx < 0 || ny < 0 || nx >= _AtlasW || ny >= _AtlasH)
+            {
+                nearBoundary = true;
+                continue;
+            }
+            uint nPacked = _AtlasBufSrc[ny * _AtlasW + nx];
+            uint nA = (nPacked >> 24) & 0xFF;
+            if (nA == 0) nearBoundary = true;
+        }
+    }
+
+    if (!nearBoundary) return;
+
+    // Gaussian-weighted blend of filled neighbors within _BlendRadius
+    float sigmaS = (float)_BlendRadius * 0.5;
+    float invSigS2 = -0.5 / (sigmaS * sigmaS);
+    float wSum = 0;
+    float3 colorSum = 0;
+
+    for (int by = -_BlendRadius; by <= _BlendRadius; by++)
+    {
+        for (int bx = -_BlendRadius; bx <= _BlendRadius; bx++)
+        {
+            int sx = (int)id.x + bx;
+            int sy = (int)id.y + by;
+            if (sx < 0 || sy < 0 || sx >= _AtlasW || sy >= _AtlasH) continue;
+
+            uint nPacked = _AtlasBufSrc[sy * _AtlasW + sx];
+            uint nA = (nPacked >> 24) & 0xFF;
+            if (nA == 0) continue;
+
+            float dist2 = (float)(bx * bx + by * by);
+            float w = exp(dist2 * invSigS2);
+
+            float3 c = float3((nPacked & 0xFF) / 255.0,
+                              ((nPacked >> 8) & 0xFF) / 255.0,
+                              ((nPacked >> 16) & 0xFF) / 255.0);
+            colorSum += c * w;
+            wSum += w;
+        }
+    }
+
+    if (wSum > 1e-6)
+    {
+        float3 blended = colorSum / wSum;
+        uint r = (uint)round(saturate(blended.x) * 255.0);
+        uint g = (uint)round(saturate(blended.y) * 255.0);
+        uint b = (uint)round(saturate(blended.z) * 255.0);
+        _AtlasBuf[idx] = r | (g << 8) | (b << 16) | (255u << 24);
+    }
+}
+
+// ═════════════════════════════════════════════════════════════
+//  Kernel 4: Multi-view blend accumulation (pass 2 per keyframe)
+//  After pass 1 (BakeAtlas) establishes best scores, this kernel
+//  accumulates score-weighted colors from all qualifying views
+//  into fixed-point buffers using atomic adds.
+//  A texel qualifies if its score > _BlendMinFraction * bestScore.
+// ═════════════════════════════════════════════════════════════
+
+RWStructuredBuffer<uint> _AccumR;   // fixed-point R sum (×65536)
+RWStructuredBuffer<uint> _AccumG;   // fixed-point G sum (×65536)
+RWStructuredBuffer<uint> _AccumB;   // fixed-point B sum (×65536)
+RWStructuredBuffer<uint> _AccumW;   // fixed-point weight sum (×65536)
+StructuredBuffer<uint>   _BestScore; // best score from pass 1 (read-only)
+float _BlendMinFraction;            // threshold: 0.3 = top ~30% of best score
+
+[numthreads(64, 1, 1)]
+void BlendAccum(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _OutTriCount) return;
+
+    int t = (int)id.x;
+    int i0 = _OutIdx[t * 3];
+    int i1 = _OutIdx[t * 3 + 1];
+    int i2 = _OutIdx[t * 3 + 2];
+
+    float3 p0 = _OutPos[i0], p1 = _OutPos[i1], p2 = _OutPos[i2];
+    float3 n0 = _OutNorm[i0];
+
+    float3 fn = cross(p1 - p0, p2 - p0);
+    float fnLen = length(fn);
+    fn = fnLen > 0.001 ? fn / fnLen : n0;
+
+    float3 triCenter = (p0 + p1 + p2) / 3.0;
+    float3 vd = _CamPos.xyz - triCenter;
+    float vdLen = length(vd);
+    if (vdLen < 0.001) return;
+    vd /= vdLen;
+
+    float dotNV = dot(fn, vd);
+    if (dotNV <= 0.05) return;
+
+    float score = dotNV / max(vdLen, 0.1);
+
+    float3 c0 = mul(_ViewMat, float4(p0, 1)).xyz;
+    float3 c1 = mul(_ViewMat, float4(p1, 1)).xyz;
+    float3 c2 = mul(_ViewMat, float4(p2, 1)).xyz;
+
+    float2 sp0 = float2(_Fx * c0.x / max(c0.z, 0.001) + _Cx - _CropX,
+                         _Fy * c0.y / max(c0.z, 0.001) + _Cy - _CropY);
+    float2 sp1 = float2(_Fx * c1.x / max(c1.z, 0.001) + _Cx - _CropX,
+                         _Fy * c1.y / max(c1.z, 0.001) + _Cy - _CropY);
+    float2 sp2 = float2(_Fx * c2.x / max(c2.z, 0.001) + _Cx - _CropX,
+                         _Fy * c2.y / max(c2.z, 0.001) + _Cy - _CropY);
+
+    float mw = (float)_ImgW * 0.1, mh = (float)_ImgH * 0.1;
+    bool in0 = sp0.x >= -mw && sp0.x < _ImgW + mw && sp0.y >= -mh && sp0.y < _ImgH + mh;
+    bool in1 = sp1.x >= -mw && sp1.x < _ImgW + mw && sp1.y >= -mh && sp1.y < _ImgH + mh;
+    bool in2 = sp2.x >= -mw && sp2.x < _ImgW + mw && sp2.y >= -mh && sp2.y < _ImgH + mh;
+    if (!in0 && !in1 && !in2) return;
+
+    float2 uv0 = _RawUV[i0], uv1 = _RawUV[i1], uv2 = _RawUV[i2];
+
+    int minX = max(0, (int)floor(min(uv0.x, min(uv1.x, uv2.x))));
+    int maxX = min(_AtlasW - 1, (int)ceil(max(uv0.x, max(uv1.x, uv2.x))));
+    int minY = max(0, (int)floor(min(uv0.y, min(uv1.y, uv2.y))));
+    int maxY = min(_AtlasH - 1, (int)ceil(max(uv0.y, max(uv1.y, uv2.y))));
+
+    float denom = (uv1.y - uv2.y) * (uv0.x - uv2.x) + (uv2.x - uv1.x) * (uv0.y - uv2.y);
+    if (abs(denom) < 1e-8) return;
+    float invD = 1.0 / denom;
+
+    float a0x = uv1.y - uv2.y, a0y = uv2.x - uv1.x;
+    float a1x = uv2.y - uv0.y, a1y = uv0.x - uv2.x;
+
+    for (int y = minY; y <= maxY; y++)
+    {
+        float dy = (float)y - uv2.y;
+        for (int x = minX; x <= maxX; x++)
+        {
+            float dx = (float)x - uv2.x;
+            float bw0 = (a0x * dx + a0y * dy) * invD;
+            float bw1 = (a1x * dx + a1y * dy) * invD;
+            float bw2 = 1.0 - bw0 - bw1;
+            if (bw0 < -0.001 || bw1 < -0.001 || bw2 < -0.001) continue;
+
+            int texelIdx = y * _AtlasW + x;
+
+            // Skip texels whose best score is zero (never filled in pass 1)
+            float bestS = asfloat(_BestScore[texelIdx]);
+            if (bestS <= 0) continue;
+
+            // Only accumulate if this view's score meets the threshold
+            if (score < _BlendMinFraction * bestS) continue;
+
+            float sx = bw0 * sp0.x + bw1 * sp1.x + bw2 * sp2.x;
+            float sy = bw0 * sp0.y + bw1 * sp1.y + bw2 * sp2.y;
+            int px = (int)round(sx);
+            int py = (int)round(sy);
+            if (px < 0 || px >= _ImgW || py < 0 || py >= _ImgH) continue;
+
+            // Occlusion check
+            float3 worldPt = bw0 * p0 + bw1 * p1 + bw2 * p2;
+            float3 camPt = mul(_ViewMat, float4(worldPt, 1)).xyz;
+            float closestZ = asfloat(_DepthBuf[py * _ImgW + px]);
+            if (camPt.z > closestZ + 0.05) continue;
+
+            uint kfColor = _KfPixels[py * _ImgW + px];
+            float r = (float)(kfColor & 0xFF);
+            float g = (float)((kfColor >> 8) & 0xFF);
+            float b = (float)((kfColor >> 16) & 0xFF);
+
+            // Fixed-point accumulation: scale by 256 to preserve fractional precision
+            // score is typically 0.01-10.0, so score*256 fits in uint range
+            uint ws = (uint)(score * 256.0);
+            InterlockedAdd(_AccumR[texelIdx], (uint)(r * ws));
+            InterlockedAdd(_AccumG[texelIdx], (uint)(g * ws));
+            InterlockedAdd(_AccumB[texelIdx], (uint)(b * ws));
+            InterlockedAdd(_AccumW[texelIdx], ws);
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════
+//  Kernel 5: Resolve blended atlas — divide accumulated color
+//  by weight sum to produce final packed RGBA texels.
+// ═════════════════════════════════════════════════════════════
+
+StructuredBuffer<uint>   _AccumRIn;
+StructuredBuffer<uint>   _AccumGIn;
+StructuredBuffer<uint>   _AccumBIn;
+StructuredBuffer<uint>   _AccumWIn;
+
+[numthreads(256, 1, 1)]
+void ResolveBlend(uint3 id : SV_DispatchThreadID)
+{
+    int idx = (int)id.x;
+    if (idx >= _AtlasW * _AtlasH) return;
+
+    uint w = _AccumWIn[idx];
+    if (w == 0)
+    {
+        _AtlasBuf[idx] = 0;
+        return;
+    }
+
+    uint r = clamp(_AccumRIn[idx] / w, 0, 255);
+    uint g = clamp(_AccumGIn[idx] / w, 0, 255);
+    uint b = clamp(_AccumBIn[idx] / w, 0, 255);
+    _AtlasBuf[idx] = r | (g << 8) | (b << 16) | (255u << 24);
+}
+
+// ═════════════════════════════════════════════════════════════
+//  Kernel 6: Unsharp mask sharpening on the atlas.
+//  sharpened = original + strength * (original - gaussian_blur)
+//  Reads from _AtlasBufSrc (snapshot), writes to _AtlasBuf.
+//  Only processes filled texels (alpha > 0) and only samples
+//  from filled neighbors so UV island edges stay clean.
+// ═════════════════════════════════════════════════════════════
+
+float _SharpenStrength;  // typically 0.3 - 1.0
+int   _SharpenRadius;    // 1 = 3x3, 2 = 5x5
+
+[numthreads(8, 8, 1)]
+void SharpenAtlas(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _AtlasW || (int)id.y >= _AtlasH) return;
+
+    int idx = (int)id.y * _AtlasW + (int)id.x;
+    uint centerPacked = _AtlasBufSrc[idx];
+    if ((centerPacked >> 24) == 0) return;
+
+    float3 centerColor = float3(
+        (float)(centerPacked & 0xFF),
+        (float)((centerPacked >> 8) & 0xFF),
+        (float)((centerPacked >> 16) & 0xFF));
+
+    float sigma = max((float)_SharpenRadius, 1.0);
+    float invSig2 = -0.5 / (sigma * sigma);
+    float3 blurSum = 0;
+    float wSum = 0;
+
+    for (int dy = -_SharpenRadius; dy <= _SharpenRadius; dy++)
+    {
+        for (int dx = -_SharpenRadius; dx <= _SharpenRadius; dx++)
+        {
+            int nx = (int)id.x + dx;
+            int ny = (int)id.y + dy;
+            if (nx < 0 || ny < 0 || nx >= _AtlasW || ny >= _AtlasH) continue;
+
+            uint nPacked = _AtlasBufSrc[ny * _AtlasW + nx];
+            if ((nPacked >> 24) == 0) continue;
+
+            float dist2 = (float)(dx * dx + dy * dy);
+            float gw = exp(dist2 * invSig2);
+
+            float3 nc = float3(
+                (float)(nPacked & 0xFF),
+                (float)((nPacked >> 8) & 0xFF),
+                (float)((nPacked >> 16) & 0xFF));
+
+            blurSum += nc * gw;
+            wSum += gw;
+        }
+    }
+
+    if (wSum < 1e-6) return;
+
+    float3 blurred = blurSum / wSum;
+    float3 sharpened = centerColor + _SharpenStrength * (centerColor - blurred);
+    sharpened = clamp(sharpened, 0, 255);
+
+    uint r = (uint)round(sharpened.x);
+    uint g = (uint)round(sharpened.y);
+    uint b = (uint)round(sharpened.z);
+    _AtlasBuf[idx] = r | (g << 8) | (b << 16) | (255u << 24);
 }

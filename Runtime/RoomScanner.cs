@@ -4,7 +4,6 @@ using System.Threading.Tasks;
 using Genesis.RoomScan.GSplat;
 using Genesis.RoomScan.UI;
 using UnityEngine;
-using UnityEngine.Networking;
 using UnityEngine.Rendering;
 using UnityEngine.Serialization;
 
@@ -84,6 +83,14 @@ namespace Genesis.RoomScan
         [SerializeField] internal bool forceCpuBake = false;
         [Tooltip("Skip denoise pass after baking (GPU bake has fewer speckles)")]
         [SerializeField] internal bool skipDenoise = true;
+        [Tooltip("Multi-view blend: 2-pass GPU bake that blends top views per texel for smoother textures")]
+        [SerializeField] internal bool multiViewBlend = true;
+        [Tooltip("Unsharp mask strength to restore crispness after multi-view blending (0 = off)")]
+        [Range(0f, 2f)]
+        [SerializeField] internal float sharpenStrength = 0.8f;
+        [Tooltip("Server-side atlas super-resolution scale (1 = SR off, just inpaint)")]
+        [Range(1, 4)]
+        [SerializeField] internal int hqRefineScale = 2;
 
         [Header("Unwrap Performance")]
         [Tooltip("Simplify mesh before UV unwrap (0.1 = 10% of tris, 1.0 = no simplification). " +
@@ -170,8 +177,11 @@ namespace Genesis.RoomScan
         public bool HasHQRefinedTexture { get; private set; }
         public bool IsRefining { get; private set; }
         public bool IsHQRefining { get; private set; }
+        public bool IsMeshEnhancing { get; private set; }
+        public bool HasEnhancedMesh { get; internal set; }
         public string RefineStatus { get; private set; }
         public string HQRefineStatus { get; private set; }
+        public string MeshEnhanceStatus { get; private set; }
 
         /// <summary>
         /// Shared UV mesh data used by persistence to save/restore refinement results.
@@ -455,7 +465,10 @@ namespace Genesis.RoomScan
                 _downloadedPlyData = null;
                 HasRefinedTexture = false;
                 HasHQRefinedTexture = false;
+                HasEnhancedMesh = false;
                 LastRefinedResult = null;
+                _cachedUnwrap = null;
+                _refinedMesh = null;
 
                 _meshExtractor.DisposeOnly();
                 _volumeIntegrator.Clear();
@@ -614,6 +627,8 @@ namespace Genesis.RoomScan
             RefineStatus = "Starting...";
 
             TextureRefinement.StatusChanged += s => RefineStatus = s;
+            TextureRefinement.EnableMultiViewBlend = multiViewBlend;
+            TextureRefinement.SharpenStrength = sharpenStrength;
             try
             {
                 string keyframeDir = KeyframeDirectory;
@@ -670,90 +685,61 @@ namespace Genesis.RoomScan
                     return;
                 }
 
-                TextureRefinement.StatusChanged += s => HQRefineStatus = s;
-                UnwrappedMeshResult unwrap;
-                try { unwrap = await EnsureUnwrappedAsync(); }
-                finally { TextureRefinement.StatusChanged -= s => HQRefineStatus = s; }
-
-                HQRefineStatus = "Packaging...";
-                string serverUrl = _gsplatServerClient.ServerUrl;
-                string keyframeDir = KeyframeDirectory;
-                byte[] zipData = await Task.Run(() => PackRefinementZip(keyframeDir, unwrap));
-
-                if (zipData == null || zipData.Length == 0)
+                // Auto-trigger on-device refinement if not done yet
+                if (!LastRefinedResult.HasValue)
                 {
-                    HQRefineStatus = "No data to upload";
+                    HQRefineStatus = "Running on-device refine first...";
+                    TextureRefinement.StatusChanged += s => HQRefineStatus = s;
+                    try
+                    {
+                        StartTextureRefinement();
+                        while (IsRefining) await Task.Yield();
+                    }
+                    finally { TextureRefinement.StatusChanged -= s => HQRefineStatus = s; }
+
+                    if (!LastRefinedResult.HasValue)
+                    {
+                        HQRefineStatus = "On-device refine failed";
+                        return;
+                    }
+                }
+
+                // Encode current refined atlas to PNG
+                HQRefineStatus = "Encoding atlas...";
+                byte[] pngBytes;
+                var r = LastRefinedResult.Value;
+                if (r.AtlasPixels != null)
+                {
+                    var srcTex = new Texture2D(r.AtlasWidth, r.AtlasHeight, TextureFormat.RGBA32, false);
+                    srcTex.SetPixelData(r.AtlasPixels, 0);
+                    srcTex.Apply();
+                    pngBytes = ImageConversion.EncodeToPNG(srcTex);
+                    UnityEngine.Object.Destroy(srcTex);
+                }
+                else if (_refinedAtlasTexture != null)
+                {
+                    pngBytes = ImageConversion.EncodeToPNG(_refinedAtlasTexture);
+                }
+                else
+                {
+                    HQRefineStatus = "No atlas data available";
                     return;
                 }
 
-                // Phase 1: Upload
-                HQRefineStatus = "Uploading...";
-                using (var upload = new UnityWebRequest($"{serverUrl}/refine-texture", "POST"))
+                Debug.Log($"[RoomScan] HQ refine: uploading {pngBytes.Length / 1024}KB atlas, scale={hqRefineScale}");
+                HQRefineStatus = $"Uploading ({pngBytes.Length / 1024}KB)...";
+
+                byte[] resultPng = await _gsplatServerClient.EnhanceAtlasAsync(pngBytes, hqRefineScale, inpaint: true);
+
+                if (resultPng == null || resultPng.Length == 0)
                 {
-                    upload.uploadHandler = new UploadHandlerRaw(zipData);
-                    upload.downloadHandler = new DownloadHandlerBuffer();
-                    upload.SetRequestHeader("Content-Type", "application/octet-stream");
-                    upload.timeout = 300;
-                    await upload.SendWebRequest();
-
-                    if (upload.result != UnityWebRequest.Result.Success)
-                    {
-                        HQRefineStatus = $"Upload failed: {upload.error}";
-                        Debug.LogError($"[RoomScan] HQ refine upload failed: {upload.error}");
-                        return;
-                    }
-                    Debug.Log($"[RoomScan] HQ refine upload OK: {upload.downloadHandler.text}");
-                }
-
-                // Phase 2: Poll until done
-                while (true)
-                {
-                    await Task.Delay(3000);
-                    using var poll = UnityWebRequest.Get($"{serverUrl}/refine-texture/status");
-                    poll.timeout = 10;
-                    await poll.SendWebRequest();
-
-                    if (poll.result != UnityWebRequest.Result.Success)
-                    {
-                        HQRefineStatus = $"Poll error: {poll.error}";
-                        Debug.LogWarning($"[RoomScan] HQ refine poll error: {poll.error}");
-                        continue;
-                    }
-
-                    var status = JsonUtility.FromJson<HQRefineServerStatus>(poll.downloadHandler.text);
-                    if (status.state == "done")
-                    {
-                        HQRefineStatus = "Downloading result...";
-                        break;
-                    }
-                    if (status.state == "error")
-                    {
-                        HQRefineStatus = $"Server error: {status.message}";
-                        Debug.LogError($"[RoomScan] HQ refine server error: {status.message}");
-                        return;
-                    }
-
-                    int pct = Mathf.RoundToInt(status.progress * 100f);
-                    HQRefineStatus = $"Processing ({pct}%)...";
-                }
-
-                // Phase 3: Download result
-                using var download = UnityWebRequest.Get($"{serverUrl}/refine-texture/result");
-                download.timeout = 120;
-                await download.SendWebRequest();
-
-                if (download.result != UnityWebRequest.Result.Success)
-                {
-                    HQRefineStatus = $"Download failed: {download.error}";
-                    Debug.LogError($"[RoomScan] HQ refine download failed: {download.error}");
+                    HQRefineStatus = "Server returned no data";
                     return;
                 }
 
-                byte[] pngData = download.downloadHandler.data;
                 HQRefineStatus = "Applying atlas...";
-
                 var tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
-                if (ImageConversion.LoadImage(tex, pngData))
+                if (ImageConversion.LoadImage(tex, resultPng))
                 {
                     _hqAtlasTexture = tex;
                     HasHQRefinedTexture = true;
@@ -761,13 +747,10 @@ namespace Genesis.RoomScan
                     SetRenderMode(ScanRenderMode.HQRefined);
 
                     if (_persistence != null && _persistence.HasActivePackage)
-                    {
-                        byte[] rawPixels = tex.GetRawTextureData();
-                        await _persistence.SaveArtifactAsync(ArtifactType.HQRefined, rawPixels);
-                    }
+                        await _persistence.SaveArtifactAsync(ArtifactType.HQRefined, resultPng);
 
                     HQRefineStatus = "Done";
-                    Debug.Log($"[RoomScan] HQ texture refinement complete: {tex.width}x{tex.height}");
+                    Debug.Log($"[RoomScan] HQ atlas enhancement complete: {tex.width}x{tex.height}");
                 }
                 else
                 {
@@ -786,12 +769,144 @@ namespace Genesis.RoomScan
             }
         }
 
-        [Serializable]
-        private class HQRefineServerStatus
+        public async void StartMeshEnhancement()
         {
-            public string state;
-            public float progress;
-            public string message;
+            if (IsMeshEnhancing) return;
+            IsMeshEnhancing = true;
+            MeshEnhanceStatus = "Starting...";
+
+            try
+            {
+                if (_gsplatServerClient == null)
+                {
+                    MeshEnhanceStatus = "No server configured";
+                    return;
+                }
+
+                if (!LastRefinedResult.HasValue)
+                {
+                    MeshEnhanceStatus = "No refined mesh — refine first";
+                    return;
+                }
+
+                MeshEnhanceStatus = "Serializing mesh...";
+                var r = LastRefinedResult.Value;
+                byte[] meshBin = await Task.Run(() => SerializeRefinedMesh(r));
+                Debug.Log($"[RoomScan] Mesh enhance: uploading {meshBin.Length / 1024}KB ({r.Positions.Length} verts)");
+
+                MeshEnhanceStatus = $"Uploading ({meshBin.Length / 1024}KB)...";
+                byte[] resultBin = await _gsplatServerClient.EnhanceMeshAsync(
+                    meshBin, smoothIterations: 3, enablePlaneSnap: false);
+
+                if (resultBin == null || resultBin.Length == 0)
+                {
+                    MeshEnhanceStatus = "Server returned no data";
+                    return;
+                }
+
+                MeshEnhanceStatus = "Applying enhanced mesh...";
+                var enhanced = await Task.Run(() => DeserializeRefinedMesh(resultBin));
+                enhanced.AtlasPixels = r.AtlasPixels;
+
+                ApplyEnhancedMesh(enhanced);
+                HasEnhancedMesh = true;
+
+                if (_persistence != null && _persistence.HasActivePackage)
+                    await _persistence.SaveArtifactAsync(ArtifactType.EnhancedMesh, null, enhanced);
+
+                MeshEnhanceStatus = "Done";
+                Debug.Log($"[RoomScan] Mesh enhancement complete: {enhanced.Positions.Length} verts");
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[RoomScan] Mesh enhancement failed: {e.Message}\n{e.StackTrace}");
+                MeshEnhanceStatus = "Failed";
+            }
+            finally
+            {
+                IsMeshEnhancing = false;
+            }
+        }
+
+        private static byte[] SerializeRefinedMesh(RefinedTextureResult r)
+        {
+            int vertCount = r.Positions.Length;
+            int idxCount = r.Indices.Length;
+            int size = 24 + vertCount * 32 + idxCount * 4;
+
+            using var ms = new MemoryStream(size);
+            using var w = new BinaryWriter(ms);
+
+            w.Write((uint)0x46524D52); // RMRF magic
+            w.Write(1);                // version
+            w.Write(vertCount);
+            w.Write(idxCount);
+            w.Write(r.AtlasWidth);
+            w.Write(r.AtlasHeight);
+
+            for (int i = 0; i < vertCount; i++)
+            {
+                w.Write(r.Positions[i].x); w.Write(r.Positions[i].y); w.Write(r.Positions[i].z);
+                w.Write(r.Normals[i].x); w.Write(r.Normals[i].y); w.Write(r.Normals[i].z);
+                w.Write(r.UVs[i].x); w.Write(r.UVs[i].y);
+            }
+            foreach (int idx in r.Indices) w.Write(idx);
+
+            return ms.ToArray();
+        }
+
+        private static RefinedTextureResult DeserializeRefinedMesh(byte[] data)
+        {
+            using var ms = new MemoryStream(data);
+            using var r = new BinaryReader(ms);
+
+            uint magic = r.ReadUInt32();
+            if (magic == 0x46524D52) r.ReadInt32(); // skip version
+            else ms.Position = 4; // no header, rewind past magic (treat as vertCount)
+
+            int vertCount = magic == 0x46524D52 ? r.ReadInt32() : (int)magic;
+            int idxCount = r.ReadInt32();
+            int atlasW = r.ReadInt32();
+            int atlasH = r.ReadInt32();
+
+            var positions = new Vector3[vertCount];
+            var normals = new Vector3[vertCount];
+            var uvs = new Vector2[vertCount];
+            for (int i = 0; i < vertCount; i++)
+            {
+                positions[i] = new Vector3(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
+                normals[i] = new Vector3(r.ReadSingle(), r.ReadSingle(), r.ReadSingle());
+                uvs[i] = new Vector2(r.ReadSingle(), r.ReadSingle());
+            }
+
+            int[] indices = new int[idxCount];
+            for (int i = 0; i < idxCount; i++) indices[i] = r.ReadInt32();
+
+            return new RefinedTextureResult
+            {
+                Positions = positions, Normals = normals, UVs = uvs,
+                Indices = indices, AtlasWidth = atlasW, AtlasHeight = atlasH,
+            };
+        }
+
+        private void ApplyEnhancedMesh(RefinedTextureResult enhanced)
+        {
+            if (_refinedMesh == null)
+            {
+                _refinedMesh = new Mesh { name = "EnhancedScanMesh", indexFormat = IndexFormat.UInt32 };
+            }
+
+            _refinedMesh.Clear();
+            _refinedMesh.SetVertices(enhanced.Positions);
+            _refinedMesh.SetNormals(enhanced.Normals);
+            _refinedMesh.SetUVs(0, enhanced.UVs);
+            _refinedMesh.SetTriangles(enhanced.Indices, 0);
+
+            EnsureRefinedRenderer();
+            _refinedMeshFilter.mesh = _refinedMesh;
+
+            if (_refinedAtlasTexture != null)
+                _refinedRenderer.material.mainTexture = _refinedAtlasTexture;
         }
 
         private void ApplyRefinedAtlas(RefinedTextureResult result)
@@ -841,28 +956,69 @@ namespace Genesis.RoomScan
                 return _cachedUnwrap.Value;
             }
 
+            // Reconstruct from persisted refined mesh if available (skip xatlas)
+            if (LastRefinedResult.HasValue)
+            {
+                var r = LastRefinedResult.Value;
+                var unwrap = ReconstructUnwrapFromResult(r);
+                _cachedUnwrap = unwrap;
+                EnsureRefinedMesh(unwrap);
+                Debug.Log("[RoomScan] Reconstructed UV mesh from persisted refined_mesh.bin (no xatlas needed)");
+                return unwrap;
+            }
+
             string kfDir = KeyframeDirectory;
             var opts = XAtlasWrapper.UnwrapOptions.Default;
             opts.MaxCost = xatlasMaxCost;
             opts.BlockAlign = useBlockAlign;
-            var unwrap = await TextureRefinement.UnwrapMeshAsync(
+            var unwrap2 = await TextureRefinement.UnwrapMeshAsync(
                 kfDir, KeyframeRelocation, opts, decimationRatio);
-            _cachedUnwrap = unwrap;
+            _cachedUnwrap = unwrap2;
 
-            EnsureRefinedMesh(unwrap);
+            EnsureRefinedMesh(unwrap2);
 
             LastRefinedResult = new RefinedTextureResult
             {
-                Positions = unwrap.Positions,
-                Normals = unwrap.Normals,
-                UVs = unwrap.UVs,
-                Indices = unwrap.Indices,
-                AtlasWidth = unwrap.AtlasWidth,
-                AtlasHeight = unwrap.AtlasHeight,
+                Positions = unwrap2.Positions,
+                Normals = unwrap2.Normals,
+                UVs = unwrap2.UVs,
+                Indices = unwrap2.Indices,
+                AtlasWidth = unwrap2.AtlasWidth,
+                AtlasHeight = unwrap2.AtlasHeight,
                 AtlasPixels = null,
             };
 
-            return unwrap;
+            return unwrap2;
+        }
+
+        /// <summary>
+        /// Rebuilds an UnwrappedMeshResult from a persisted RefinedTextureResult.
+        /// RawUVs are reconstructed from normalized UVs * atlas dimensions.
+        /// OrigPositions/OrigIndices use the unwrapped mesh as fallback (sufficient for depth buffer).
+        /// </summary>
+        private static UnwrappedMeshResult ReconstructUnwrapFromResult(RefinedTextureResult r)
+        {
+            int vertCount = r.Positions.Length;
+            float[] rawUVs = new float[vertCount * 2];
+            for (int i = 0; i < vertCount; i++)
+            {
+                rawUVs[i * 2] = r.UVs[i].x * r.AtlasWidth;
+                rawUVs[i * 2 + 1] = r.UVs[i].y * r.AtlasHeight;
+            }
+
+            return new UnwrappedMeshResult
+            {
+                Positions = r.Positions,
+                Normals = r.Normals,
+                UVs = r.UVs,
+                RawUVs = rawUVs,
+                Indices = r.Indices,
+                AtlasWidth = r.AtlasWidth,
+                AtlasHeight = r.AtlasHeight,
+                OrigPositions = r.Positions,
+                OrigNormals = r.Normals,
+                OrigIndices = r.Indices,
+            };
         }
 
         private void EnsureRefinedMesh(UnwrappedMeshResult unwrap)
@@ -895,56 +1051,6 @@ namespace Genesis.RoomScan
             }
             _refinedRenderer.material = new Material(shader);
             _refinedRenderer.enabled = false;
-        }
-
-        private byte[] PackRefinementZip(string keyframeDir, UnwrappedMeshResult mesh)
-        {
-            string framesPath = Path.Combine(keyframeDir, "frames.jsonl");
-            if (!File.Exists(framesPath)) return null;
-
-            using var ms = new MemoryStream();
-            using (var archive = new System.IO.Compression.ZipArchive(ms,
-                System.IO.Compression.ZipArchiveMode.Create, true))
-            {
-                var entry = archive.CreateEntry("frames.jsonl");
-                using (var es = entry.Open())
-                {
-                    byte[] data = TextureRefinement.RelocateFramesJsonl(keyframeDir, KeyframeRelocation);
-                    if (data == null) return null;
-                    es.Write(data, 0, data.Length);
-                }
-
-                string imagesDir = Path.Combine(keyframeDir, "images");
-                if (Directory.Exists(imagesDir))
-                {
-                    foreach (string img in Directory.GetFiles(imagesDir, "*.jpg"))
-                    {
-                        string name = "images/" + Path.GetFileName(img);
-                        var imgEntry = archive.CreateEntry(name);
-                        using var ies = imgEntry.Open();
-                        byte[] imgData = File.ReadAllBytes(img);
-                        ies.Write(imgData, 0, imgData.Length);
-                    }
-                }
-
-                var meshEntry = archive.CreateEntry("refined_mesh.bin");
-                using var mes = meshEntry.Open();
-                using var bw = new BinaryWriter(mes);
-                bw.Write(mesh.Positions.Length);
-                bw.Write(mesh.Indices.Length);
-                bw.Write(mesh.AtlasWidth);
-                bw.Write(mesh.AtlasHeight);
-                for (int i = 0; i < mesh.Positions.Length; i++)
-                {
-                    bw.Write(mesh.Positions[i].x); bw.Write(mesh.Positions[i].y); bw.Write(mesh.Positions[i].z);
-                    bw.Write(mesh.Normals[i].x); bw.Write(mesh.Normals[i].y); bw.Write(mesh.Normals[i].z);
-                    bw.Write(mesh.UVs[i].x); bw.Write(mesh.UVs[i].y);
-                }
-                foreach (int idx in mesh.Indices)
-                    bw.Write(idx);
-            }
-
-            return ms.ToArray();
         }
 
         // ─────────────────────────────────────────────────────────────
@@ -1002,6 +1108,8 @@ namespace Genesis.RoomScan
                 Texture frame = pcp.CurrentFrame;
                 if (frame != null)
                 {
+                    _depthCapture?.SetRGBGuide(frame);
+
                     Pose pose = pcp.CameraPose;
                     if (_depthCapture != null)
                         pose = _depthCapture.TrackingToWorld(pose);
@@ -1127,11 +1235,19 @@ namespace Genesis.RoomScan
                     break;
 
                 case ScanRenderMode.Refined:
-                    _persistence.DeleteArtifactFromPackage(ArtifactType.Refined);
-                    HasRefinedTexture = false;
-                    LastRefinedResult = null;
-                    _cachedUnwrap = null;
-                    SetRenderMode(ScanRenderMode.Textured);
+                    if (HasEnhancedMesh)
+                    {
+                        DeleteEnhancedMesh();
+                    }
+                    else
+                    {
+                        _persistence.DeleteArtifactFromPackage(ArtifactType.Refined);
+                        HasRefinedTexture = false;
+                        LastRefinedResult = null;
+                        _cachedUnwrap = null;
+                        _refinedMesh = null;
+                        SetRenderMode(ScanRenderMode.Textured);
+                    }
                     break;
 
                 case ScanRenderMode.HQRefined:
@@ -1141,6 +1257,34 @@ namespace Genesis.RoomScan
                     SetRenderMode(HasRefinedTexture ? ScanRenderMode.Refined : ScanRenderMode.Textured);
                     break;
             }
+        }
+
+        /// <summary>
+        /// Removes the enhanced mesh overlay and restores the original refined mesh geometry.
+        /// </summary>
+        public void DeleteEnhancedMesh()
+        {
+            if (!HasEnhancedMesh) return;
+
+            _persistence?.DeleteArtifactFromPackage(ArtifactType.EnhancedMesh);
+            HasEnhancedMesh = false;
+
+            if (LastRefinedResult.HasValue)
+            {
+                var r = LastRefinedResult.Value;
+                if (_refinedMesh != null)
+                {
+                    _refinedMesh.Clear();
+                    _refinedMesh.SetVertices(r.Positions);
+                    _refinedMesh.SetNormals(r.Normals);
+                    _refinedMesh.SetUVs(0, r.UVs);
+                    _refinedMesh.SetTriangles(r.Indices, 0);
+                    EnsureRefinedRenderer();
+                    _refinedMeshFilter.mesh = _refinedMesh;
+                }
+            }
+
+            Debug.Log("[RoomScan] Enhanced mesh deleted, original restored");
         }
 
         /// <summary>

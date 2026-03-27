@@ -42,6 +42,27 @@ namespace Genesis.RoomScan
     {
         private const int GpuVertexStride = 32; // float3 pos + float3 norm + uint color + uint voxelIdx
 
+        /// <summary>Enable GPU seam blending after atlas bake. Reduces color discontinuities at UV chart edges.</summary>
+        public static bool EnableSeamBlending { get; set; } = true;
+
+        /// <summary>Pixel radius for gaussian-weighted seam blending (1-5). Higher = wider blend band.</summary>
+        public static int SeamBlendRadius { get; set; } = 3;
+
+        /// <summary>Enable multi-view blending: two-pass GPU bake that blends top views per texel
+        /// for smoother, more seamless textures (similar to the HQ server approach).</summary>
+        public static bool EnableMultiViewBlend { get; set; } = true;
+
+        /// <summary>Fraction of best score below which a view is excluded from blending (0.0-1.0).
+        /// Lower = more views blended (smoother but potentially blurrier), higher = fewer views (sharper).</summary>
+        public static float BlendMinFraction { get; set; } = 0.3f;
+
+        /// <summary>GPU unsharp-mask strength applied after baking (0 = off, 0.5-1.5 typical).
+        /// Restores crispness lost during multi-view blending.</summary>
+        public static float SharpenStrength { get; set; } = 0.8f;
+
+        /// <summary>Radius for the Gaussian blur used in unsharp mask (1 = 3x3, 2 = 5x5, 3 = 7x7).</summary>
+        public static int SharpenRadius { get; set; } = 2;
+
         public static event Action<string> StatusChanged;
 
         // ═══════════════════════════════════════════════════════════════
@@ -431,7 +452,6 @@ namespace Genesis.RoomScan
             return kf;
         }
 
-
         /// <summary>
         /// GPU-accelerated atlas baking via compute shader.
         /// Mirrors the CPU rasterization logic 1:1 using integer pixel indexing
@@ -587,7 +607,174 @@ namespace Genesis.RoomScan
                 await Task.Yield();
             }
 
-            Debug.Log($"[TextureRefine] GPU baked {bakeCount} keyframes total");
+            Debug.Log($"[TextureRefine] GPU baked {bakeCount} keyframes total (pass 1)");
+
+            // ── Pass 2: Multi-view blend accumulation (optional) ──
+            // Re-iterates keyframes, accumulating score-weighted colors from all
+            // qualifying views into fixed-point buffers, then resolves to final atlas.
+            if (EnableMultiViewBlend)
+            {
+                int kAccum = compute.FindKernel("BlendAccum");
+                int kResolve = compute.FindKernel("ResolveBlend");
+
+                var accumR = new ComputeBuffer(texelCount, 4);
+                var accumG = new ComputeBuffer(texelCount, 4);
+                var accumB = new ComputeBuffer(texelCount, 4);
+                var accumW = new ComputeBuffer(texelCount, 4);
+                accumR.SetData(new uint[texelCount]);
+                accumG.SetData(new uint[texelCount]);
+                accumB.SetData(new uint[texelCount]);
+                accumW.SetData(new uint[texelCount]);
+
+                compute.SetBuffer(kAccum, "_OutPos", outPosBuf);
+                compute.SetBuffer(kAccum, "_OutNorm", outNormBuf);
+                compute.SetBuffer(kAccum, "_OutIdx", outIdxBuf);
+                compute.SetBuffer(kAccum, "_RawUV", rawUVBuf);
+                compute.SetBuffer(kAccum, "_AccumR", accumR);
+                compute.SetBuffer(kAccum, "_AccumG", accumG);
+                compute.SetBuffer(kAccum, "_AccumB", accumB);
+                compute.SetBuffer(kAccum, "_AccumW", accumW);
+                compute.SetBuffer(kAccum, "_BestScore", scoreBuf);
+                compute.SetFloat("_BlendMinFraction", BlendMinFraction);
+
+                ReportStatus("Multi-view blending (pass 2)...");
+                int blendCount = 0;
+
+                for (int ki = 0; ki < total; ki++)
+                {
+                    var kf = metaList[ki];
+                    if (string.IsNullOrEmpty(kf.JpgPath)) continue;
+
+                    byte[] jpgBytes;
+                    try { jpgBytes = await ReadFileAsync(kf.JpgPath); }
+                    catch { continue; }
+
+                    var tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                    if (!ImageConversion.LoadImage(tex, jpgBytes))
+                    {
+                        UnityEngine.Object.Destroy(tex);
+                        continue;
+                    }
+                    kf.Width = tex.width;
+                    kf.Height = tex.height;
+
+                    Color32[] colors = tex.GetPixels32();
+                    UnityEngine.Object.Destroy(tex);
+
+                    int imgW = kf.Width, imgH = kf.Height;
+                    int imgPixels = imgW * imgH;
+
+                    if (depthBuf == null || depthBuf.count != imgPixels)
+                    {
+                        depthBuf?.Release();
+                        depthBuf = new ComputeBuffer(imgPixels, 4);
+                        kfPixelBuf?.Release();
+                        kfPixelBuf = new ComputeBuffer(imgPixels, 4);
+                    }
+                    kfPixelBuf.SetData(colors);
+
+                    int sw = kf.SensorWidth > 0 ? kf.SensorWidth : kf.Width;
+                    int sh = kf.SensorHeight > 0 ? kf.SensorHeight : kf.Height;
+                    float cropX = (sw - kf.Width) * 0.5f;
+                    float cropY = (sh - kf.Height) * 0.5f;
+                    Matrix4x4 viewMat = Matrix4x4.TRS(kf.Position, kf.Rotation, Vector3.one).inverse;
+
+                    compute.SetMatrix("_ViewMat", viewMat);
+                    compute.SetVector("_CamPos", new Vector4(kf.Position.x, kf.Position.y, kf.Position.z, 1f));
+                    compute.SetFloat("_Fx", kf.Fx);
+                    compute.SetFloat("_Fy", kf.Fy);
+                    compute.SetFloat("_Cx", kf.Cx);
+                    compute.SetFloat("_Cy", kf.Cy);
+                    compute.SetFloat("_CropX", cropX);
+                    compute.SetFloat("_CropY", cropY);
+                    compute.SetInt("_ImgW", imgW);
+                    compute.SetInt("_ImgH", imgH);
+
+                    compute.SetBuffer(kClear, "_DepthBuf", depthBuf);
+                    compute.SetBuffer(kDepth, "_DepthBuf", depthBuf);
+                    compute.SetBuffer(kAccum, "_DepthBuf", depthBuf);
+                    compute.SetBuffer(kAccum, "_KfPixels", kfPixelBuf);
+
+                    compute.Dispatch(kClear, (imgPixels + 255) / 256, 1, 1);
+                    compute.Dispatch(kDepth, (origTriCount + 63) / 64, 1, 1);
+                    compute.Dispatch(kAccum, (outTriCount + 63) / 64, 1, 1);
+
+                    blendCount++;
+                    if (blendCount % 20 == 0 || blendCount < 3)
+                    {
+                        ReportStatus($"Multi-view blend... {blendCount}/{total}");
+                        Debug.Log($"[TextureRefine] Blend pass keyframe {blendCount}/{total}");
+                    }
+
+                    await Task.Yield();
+                }
+
+                Debug.Log($"[TextureRefine] Blend pass 2 complete: {blendCount} keyframes");
+
+                // Resolve: divide accumulated colors by weights → final atlas
+                compute.SetBuffer(kResolve, "_AccumRIn", accumR);
+                compute.SetBuffer(kResolve, "_AccumGIn", accumG);
+                compute.SetBuffer(kResolve, "_AccumBIn", accumB);
+                compute.SetBuffer(kResolve, "_AccumWIn", accumW);
+                compute.SetBuffer(kResolve, "_AtlasBuf", atlasBuf);
+                compute.Dispatch(kResolve, (texelCount + 255) / 256, 1, 1);
+
+                accumR.Release(); accumG.Release();
+                accumB.Release(); accumW.Release();
+                Debug.Log("[TextureRefine] Multi-view blend resolved");
+            }
+
+            // ── Sharpening pass (GPU unsharp mask) ──
+            if (SharpenStrength > 0.01f)
+            {
+                ReportStatus("Sharpening...");
+                int kSharpen = compute.FindKernel("SharpenAtlas");
+                var sharpenSrcBuf = new ComputeBuffer(texelCount, 4);
+                var tmp = new uint[texelCount];
+                atlasBuf.GetData(tmp);
+                sharpenSrcBuf.SetData(tmp);
+
+                compute.SetFloat("_SharpenStrength", SharpenStrength);
+                compute.SetInt("_SharpenRadius", SharpenRadius);
+                compute.SetInt("_AtlasW", atlasW);
+                compute.SetInt("_AtlasH", atlasH);
+                compute.SetBuffer(kSharpen, "_AtlasBufSrc", sharpenSrcBuf);
+                compute.SetBuffer(kSharpen, "_AtlasBuf", atlasBuf);
+
+                int groupsX = (atlasW + 7) / 8;
+                int groupsY = (atlasH + 7) / 8;
+                compute.Dispatch(kSharpen, groupsX, groupsY, 1);
+
+                sharpenSrcBuf.Release();
+                Debug.Log($"[TextureRefine] Sharpening complete (strength={SharpenStrength}, radius={SharpenRadius})");
+            }
+
+            // ── Seam blending pass (GPU) ──
+            int kSeam = -1;
+            try { kSeam = compute.FindKernel("BlendSeams"); }
+            catch { /* kernel not available in older shader variants */ }
+
+            if (kSeam >= 0 && EnableSeamBlending)
+            {
+                ReportStatus("Blending seams...");
+                var seamSrcBuf = new ComputeBuffer(texelCount, 4);
+                var tmp = new uint[texelCount];
+                atlasBuf.GetData(tmp);
+                seamSrcBuf.SetData(tmp);
+
+                compute.SetInt("_AtlasW", atlasW);
+                compute.SetInt("_AtlasH", atlasH);
+                compute.SetInt("_BlendRadius", SeamBlendRadius);
+                compute.SetBuffer(kSeam, "_AtlasBufSrc", seamSrcBuf);
+                compute.SetBuffer(kSeam, "_AtlasBuf", atlasBuf);
+
+                int groupsX = (atlasW + 7) / 8;
+                int groupsY = (atlasH + 7) / 8;
+                compute.Dispatch(kSeam, groupsX, groupsY, 1);
+
+                seamSrcBuf.Release();
+                Debug.Log("[TextureRefine] Seam blending complete");
+            }
 
             // Readback atlas buffer
             ReportStatus("Reading back atlas...");
@@ -600,23 +787,6 @@ namespace Genesis.RoomScan
                     if (atlasPixels[i * 4 + 3] != 0) filled++;
                 Debug.Log($"[TextureRefine] GPU bake pre-dilation: {filled}/{texelCount} texels filled " +
                     $"({100f * filled / texelCount:F1}%)");
-            }
-
-            // Debug atlas dump
-            try
-            {
-                var debugTex = new Texture2D(atlasW, atlasH, TextureFormat.RGBA32, false);
-                debugTex.SetPixelData(atlasPixels, 0);
-                debugTex.Apply();
-                byte[] png = ImageConversion.EncodeToPNG(debugTex);
-                UnityEngine.Object.Destroy(debugTex);
-                string debugPath = Path.Combine(Application.persistentDataPath, "debug_atlas_gpu.png");
-                File.WriteAllBytes(debugPath, png);
-                Debug.Log($"[TextureRefine] GPU debug atlas saved: {debugPath} ({png.Length / 1024}KB)");
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"[TextureRefine] Failed to save debug atlas: {e.Message}");
             }
 
             // Post-process on background thread
@@ -769,22 +939,6 @@ namespace Genesis.RoomScan
                     if (atlasPixels[i * 4 + 3] != 0) filled++;
                 Debug.Log($"[TextureRefine] Pre-dilation: {filled}/{texelCount} texels filled " +
                     $"({100f * filled / texelCount:F1}%)");
-            }
-
-            try
-            {
-                var debugTex = new Texture2D(atlasW, atlasH, TextureFormat.RGBA32, false);
-                debugTex.SetPixelData(atlasPixels, 0);
-                debugTex.Apply();
-                byte[] png = ImageConversion.EncodeToPNG(debugTex);
-                UnityEngine.Object.Destroy(debugTex);
-                string debugPath = Path.Combine(Application.persistentDataPath, "debug_atlas.png");
-                File.WriteAllBytes(debugPath, png);
-                Debug.Log($"[TextureRefine] Debug atlas saved: {debugPath} ({png.Length / 1024}KB)");
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"[TextureRefine] Failed to save debug atlas: {e.Message}");
             }
 
             if (!skipDenoise)

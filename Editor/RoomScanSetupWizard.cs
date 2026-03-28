@@ -1,8 +1,6 @@
 using System.IO;
 using System.Linq;
 using System.Xml.Linq;
-using GaussianSplatting.Runtime;
-using Genesis.RoomScan.GSplat;
 using Genesis.RoomScan.UI;
 using Meta.XR;
 using UnityEditor;
@@ -16,7 +14,7 @@ using Unity.XR.CoreUtils;
 
 namespace Genesis.RoomScan.Editor
 {
-    public class RoomScanSetupWizard : EditorWindow
+    public partial class RoomScanSetupWizard : EditorWindow
     {
         double _lastRefresh;
         const double REFRESH_SEC = 0.8;
@@ -38,9 +36,6 @@ namespace Genesis.RoomScan.Editor
         TriplanarCache _triplanarCache;
         RoomScanPersistence _persistence;
         KeyframeCollector _keyframeCollector;
-        GSplatManager _gsplatManager;
-        GaussianSplatRenderer _ugsRenderer;
-        GSplatServerClient _gsplatServerClient;
         DebugMenuController _debugMenu;
         RoomScanInputHandler _inputHandler;
         RoomAnchorManager _roomAnchor;
@@ -54,9 +49,6 @@ namespace Genesis.RoomScan.Editor
 
         bool _depthCaptureWired, _volumeWired, _meshMatWired, _triplanarWired, _computeShaderWired;
         bool _refinedShaderWired, _atlasBakeComputeWired;
-        bool _ugsRendererWired;
-        bool _ugsRenderFeatureAdded;
-        bool _deferredRendering;
         bool _boundarylessManifest;
         bool _cleartextAllowed;
         bool _insecureHttpAllowed;
@@ -69,7 +61,6 @@ namespace Genesis.RoomScan.Editor
         static readonly Color COL_SECT = new(0.18f, 0.18f, 0.22f);
 
         const string PKG = "Packages/com.genesis.roomscan/Runtime/Shaders/";
-        const string GSPLAT_PKG = "Packages/com.genesis.roomscan/Runtime/GSplat/Shaders/";
 
         [MenuItem("RoomScan/Setup Scene")]
         static void Open()
@@ -123,9 +114,6 @@ namespace Genesis.RoomScan.Editor
             _triplanarCache = FindAny<TriplanarCache>();
             _persistence = FindAny<RoomScanPersistence>();
             _keyframeCollector = FindAny<KeyframeCollector>();
-            _gsplatManager = FindAny<GSplatManager>();
-            _ugsRenderer = FindAny<GaussianSplatRenderer>();
-            _gsplatServerClient = FindAny<GSplatServerClient>();
             _debugMenu = FindAny<DebugMenuController>();
             _inputHandler = FindAny<RoomScanInputHandler>();
             _roomAnchor = FindAny<RoomAnchorManager>();
@@ -151,38 +139,21 @@ namespace Genesis.RoomScan.Editor
                 "refinedMeshShader");
             _atlasBakeComputeWired = _textureRefinement != null && AreFieldsAssigned(_textureRefinement,
                 "atlasBakeCompute");
-            _ugsRendererWired = _ugsRenderer != null && AreFieldsAssigned(_ugsRenderer,
-                "m_ShaderSplats", "m_ShaderComposite", "m_ShaderDebugPoints", "m_ShaderDebugBoxes", "m_CSSplatUtilities");
-            _ugsRenderFeatureAdded = HasUGSRenderFeature();
-            _deferredRendering = IsDeferredRendering();
+            RefreshGSplat();
 
             _boundarylessManifest = ManifestHasBoundaryless();
             _cleartextAllowed = ManifestHasCleartextTraffic();
             _insecureHttpAllowed = PlayerSettings.insecureHttpOption != InsecureHttpOption.NotAllowed;
-
-            RefreshServerUrl();
         }
 
-        bool _serverUrlCurrent;
-        string _detectedLanIp;
-        string _currentServerUrl;
-
-        void RefreshServerUrl()
-        {
-            _serverUrlCurrent = false;
-            _detectedLanIp = GetLanIp();
-            _currentServerUrl = null;
-
-            if (_gsplatServerClient == null || string.IsNullOrEmpty(_detectedLanIp)) return;
-
-            var so = new SerializedObject(_gsplatServerClient);
-            var prop = so.FindProperty("serverUrl");
-            if (prop == null) return;
-
-            _currentServerUrl = prop.stringValue;
-            string expected = $"http://{_detectedLanIp}:8420";
-            _serverUrlCurrent = _currentServerUrl == expected;
-        }
+        // Partial methods implemented in RoomScanSetupWizard.GSplat.cs when
+        // HAS_GAUSSIAN_SPLATTING is defined; silent no-ops otherwise.
+        partial void RefreshGSplat();
+        partial void DrawGSplatOptionalStatus();
+        partial void CheckGSplatAnyMissing(ref bool anyMissing);
+        partial void DrawGSplatShaderStatus(ref bool needsFix);
+        partial void WireGSplatComponents();
+        partial void SetupGSplatIfAvailable(GameObject root);
 
         // =================================================================
         //  GUI
@@ -575,26 +546,7 @@ namespace Genesis.RoomScan.Editor
             StatusRowOptional("PassthroughCameraAccess", _pcaComponent != null);
             StatusRowOptional("TriplanarCache", _triplanarCache != null);
             StatusRowOptional("KeyframeCollector", _keyframeCollector != null);
-            StatusRowOptional("GSplatManager (Gaussian Splat)", _gsplatManager != null);
-            StatusRowOptional("GaussianSplatRenderer (UGS)", _ugsRenderer != null);
-            StatusRowOptional("GSplatServerClient (PC training)", _gsplatServerClient != null);
-            if (_gsplatServerClient != null)
-            {
-                if (_serverUrlCurrent)
-                {
-                    StatusRow($"  Server URL \u2192 {_detectedLanIp}:8420", true);
-                }
-                else
-                {
-                    string stale = string.IsNullOrEmpty(_currentServerUrl) ? "(empty)" : _currentServerUrl;
-                    StatusRow($"  Server URL stale: {stale} (LAN: {_detectedLanIp})", false);
-                    if (GUILayout.Button("Fix Server URL"))
-                    {
-                        ConfigureServerUrl();
-                        Refresh();
-                    }
-                }
-            }
+            DrawGSplatOptionalStatus();
             StatusRowOptional("TextureRefinement", _roomScanner != null && _roomScanner.GetComponent<TextureRefinement>() != null);
             StatusRowOptional("CameraDebugOverlay", _cameraDebug != null);
             StatusRowOptional("DepthDebugOverlay", _depthDebug != null);
@@ -602,8 +554,9 @@ namespace Genesis.RoomScan.Editor
             StatusRowOptional("DebugMenuController (HUD)", _debugMenu != null);
 
             bool anyOptionalMissing = _cameraProvider == null || _triplanarCache == null ||
-                                      _gsplatManager == null || _debugMenu == null ||
+                                      _debugMenu == null ||
                                       _inputHandler == null;
+            CheckGSplatAnyMissing(ref anyOptionalMissing);
             if (anyOptionalMissing)
             {
                 GUILayout.Space(2);
@@ -679,8 +632,7 @@ namespace Genesis.RoomScan.Editor
                 Undo.AddComponent<TriplanarCache>(root);
             if (root.GetComponent<TextureRefinement>() == null)
                 Undo.AddComponent<TextureRefinement>(root);
-            // GSplat module (separate assembly)
-            SetupGSplatModule(root);
+            SetupGSplatIfAvailable(root);
 
             // Optional components not covered by RequireComponent
             if (root.GetComponent<RoomScanInputHandler>() == null)
@@ -974,10 +926,7 @@ namespace Genesis.RoomScan.Editor
 
             if (_textureRefinement != null)   { StatusRow("RefinedMesh shader (texture refine)", _refinedShaderWired); needsFix |= !_refinedShaderWired; }
             if (_textureRefinement != null)   { StatusRow("AtlasBakeCompute (GPU bake)", _atlasBakeComputeWired);      needsFix |= !_atlasBakeComputeWired; }
-
-            if (_ugsRenderer != null)    { StatusRow("UGS renderer shaders + compute", _ugsRendererWired);        needsFix |= !_ugsRendererWired; }
-            if (_ugsRenderer != null)    { StatusRow("UGS RenderFeature on URP Renderer", _ugsRenderFeatureAdded); needsFix |= !_ugsRenderFeatureAdded; }
-            if (_ugsRenderer != null)    { StatusRow("URP Deferred Rendering (req. by UGS)", _deferredRendering);  needsFix |= !_deferredRendering; }
+            DrawGSplatShaderStatus(ref needsFix);
 
             if (needsFix)
             {
@@ -1002,8 +951,7 @@ namespace Genesis.RoomScan.Editor
 
             var tr = _roomScanner != null ? _roomScanner.GetComponent<TextureRefinement>() : null;
             WireComponent(tr);
-
-            WireComponent(_ugsRenderer);
+            WireGSplatComponents();
 
             MarkDirty();
             Refresh();
@@ -1052,131 +1000,6 @@ namespace Genesis.RoomScan.Editor
             AssetDatabase.CreateAsset(mat, matPath);
             AssetDatabase.SaveAssets();
             return mat;
-        }
-
-        static Material GetOrCreateSplatMaterial()
-        {
-            const string pkgMatPath = "Packages/com.genesis.roomscan/Runtime/GSplat/Materials/SplatRender.mat";
-            var pkgMat = AssetDatabase.LoadAssetAtPath<Material>(pkgMatPath);
-            if (pkgMat != null) return pkgMat;
-
-            Shader shader = Shader.Find("Genesis/SplatRender");
-            if (shader == null)
-            {
-                Debug.LogWarning("[RoomScan Setup] Shader 'Genesis/SplatRender' not found");
-                return null;
-            }
-
-            if (!AssetDatabase.IsValidFolder("Assets/RoomScan"))
-                AssetDatabase.CreateFolder("Assets", "RoomScan");
-
-            var mat = new Material(shader) { name = "SplatRender" };
-            const string matPath = "Assets/RoomScan/SplatRender.mat";
-            AssetDatabase.CreateAsset(mat, matPath);
-            AssetDatabase.SaveAssets();
-            return mat;
-        }
-
-        // -- URP Renderer Feature -----------------------------------------
-
-        static UniversalRendererData FindActiveRendererData()
-        {
-            var pipeline = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline
-                as UniversalRenderPipelineAsset;
-            if (pipeline == null) return null;
-
-            var so = new SerializedObject(pipeline);
-            var list = so.FindProperty("m_RendererDataList");
-            if (list == null || list.arraySize == 0) return null;
-
-            return list.GetArrayElementAtIndex(0).objectReferenceValue
-                as UniversalRendererData;
-        }
-
-        static bool HasUGSRenderFeature()
-        {
-            var rd = FindActiveRendererData();
-            if (rd == null) return false;
-            foreach (var f in rd.rendererFeatures)
-            {
-                if (f != null && f.GetType().Name == "GaussianSplatURPFeature") return true;
-            }
-            return false;
-        }
-
-        const int RENDERING_MODE_DEFERRED = 1;
-
-        static bool IsDeferredRendering()
-        {
-            var rd = FindActiveRendererData();
-            if (rd == null) return false;
-            var so = new SerializedObject(rd);
-            var prop = so.FindProperty("m_RenderingMode");
-            return prop != null && prop.intValue == RENDERING_MODE_DEFERRED;
-        }
-
-        static void SetDeferredRendering()
-        {
-            var rd = FindActiveRendererData();
-            if (rd == null)
-            {
-                Debug.LogWarning("[RoomScan Setup] No active URP RendererData found");
-                return;
-            }
-
-            var so = new SerializedObject(rd);
-            var prop = so.FindProperty("m_RenderingMode");
-            if (prop == null) return;
-
-            if (prop.intValue != RENDERING_MODE_DEFERRED)
-            {
-                prop.intValue = RENDERING_MODE_DEFERRED;
-                so.ApplyModifiedProperties();
-                EditorUtility.SetDirty(rd);
-                AssetDatabase.SaveAssets();
-                Debug.Log("[RoomScan Setup] Switched URP Renderer to Deferred rendering (required by UGS)");
-            }
-        }
-
-        static void AddUGSRenderFeature()
-        {
-            var rd = FindActiveRendererData();
-            if (rd == null)
-            {
-                Debug.LogWarning("[RoomScan Setup] No active URP RendererData found");
-                return;
-            }
-
-            // Find the GaussianSplatURPFeature type from the UGS assembly
-            System.Type featureType = null;
-            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
-            {
-                featureType = asm.GetType("GaussianSplatting.Runtime.GaussianSplatURPFeature");
-                if (featureType != null) break;
-            }
-            if (featureType == null)
-            {
-                Debug.LogWarning("[RoomScan Setup] GaussianSplatURPFeature type not found — " +
-                    "ensure UGS package has GS_ENABLE_URP defined and Unity 6+");
-                return;
-            }
-
-            var feature = (ScriptableRendererFeature)CreateInstance(featureType);
-            feature.name = "Gaussian Splat Renderer";
-            feature.SetActive(true);
-
-            Undo.RecordObject(rd, "Add UGS Render Feature");
-            AssetDatabase.AddObjectToAsset(feature, rd);
-
-            var so = new SerializedObject(rd);
-            var features = so.FindProperty("m_RendererFeatures");
-            features.arraySize++;
-            features.GetArrayElementAtIndex(features.arraySize - 1).objectReferenceValue = feature;
-            so.ApplyModifiedProperties();
-
-            EditorUtility.SetDirty(rd);
-            AssetDatabase.SaveAssets();
-            Debug.Log("[RoomScan Setup] Added GaussianSplatURPFeature to URP Renderer");
         }
 
         // -- Native Plugins -----------------------------------------------
@@ -1282,69 +1105,9 @@ namespace Genesis.RoomScan.Editor
                 }
             }
 
-            // If it's a GaussianSplatRenderer (UGS), wire its shaders
-            if (component is GaussianSplatRenderer ugsr)
-            {
-                const string UGS_PKG = "Packages/org.nesnausk.gaussian-splatting/Shaders/";
-                var so = new SerializedObject(ugsr);
-                AssignAsset<Shader>(so, "m_ShaderSplats", UGS_PKG + "RenderGaussianSplats.shader");
-                AssignAsset<Shader>(so, "m_ShaderComposite", UGS_PKG + "GaussianComposite.shader");
-                AssignAsset<Shader>(so, "m_ShaderDebugPoints", UGS_PKG + "GaussianDebugRenderPoints.shader");
-                AssignAsset<Shader>(so, "m_ShaderDebugBoxes", UGS_PKG + "GaussianDebugRenderBoxes.shader");
-                AssignCompute(so, "m_CSSplatUtilities", UGS_PKG + "SplatUtilities.compute");
-                so.ApplyModifiedProperties();
-                EditorUtility.SetDirty(ugsr);
-
-                if (!HasUGSRenderFeature()) AddUGSRenderFeature();
-                if (!IsDeferredRendering()) SetDeferredRendering();
-            }
-        }
-
-        /// <summary>
-        /// Sets up the full GSplat module on the given root: adds GSplatManager (from the GSplat
-        /// assembly), GSplatServerClient, the SplatRenderer child GO, wires UGS shaders, and
-        /// auto-configures the server URL.
-        /// </summary>
-        internal static void SetupGSplatModule(GameObject root)
-        {
-            // Find GSplatManager type by reflection
-            System.Type gsplatManagerType = null;
-            System.Type gsplatClientType = null;
-            foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
-            {
-                gsplatManagerType ??= asm.GetType("Genesis.RoomScan.GSplat.GSplatManager");
-                gsplatClientType ??= asm.GetType("Genesis.RoomScan.GSplat.GSplatServerClient");
-                if (gsplatManagerType != null && gsplatClientType != null) break;
-            }
-
-            if (gsplatManagerType == null)
-            {
-                Debug.LogWarning("[RoomScan Setup] GSplatManager type not found — is the GaussianSplatting package installed?");
-                return;
-            }
-
-            if (root.GetComponent(gsplatManagerType) == null)
-                Undo.AddComponent(root, gsplatManagerType);
-            if (gsplatClientType != null && root.GetComponent(gsplatClientType) == null)
-                Undo.AddComponent(root, gsplatClientType);
-
-            // SplatRenderer child GO with GaussianSplatRenderer
-            var splatChild = root.transform.Find("SplatRenderer");
-            if (splatChild == null)
-            {
-                var go = new GameObject("SplatRenderer");
-                go.transform.SetParent(root.transform, false);
-                Undo.RegisterCreatedObjectUndo(go, "Create SplatRenderer");
-                splatChild = go.transform;
-            }
-
-            var ugsType = typeof(GaussianSplatRenderer);
-            var ugsr = splatChild.GetComponent(ugsType);
-            if (ugsr == null)
-                ugsr = Undo.AddComponent(splatChild.gameObject, ugsType);
-
-            WireComponent(ugsr);
-            ConfigureServerUrl();
+#if HAS_GAUSSIAN_SPLATTING
+            WireGSplatComponent(component);
+#endif
         }
 
         internal static void BuildXAtlasPlugin()
@@ -1837,31 +1600,6 @@ namespace Genesis.RoomScan.Editor
             AssetDatabase.SaveAssets();
             Debug.Log($"[RoomScanWizard] Created PanelSettings (WorldSpace) at {assetPath}");
             return panel;
-        }
-
-        /// <summary>
-        /// Auto-detect this PC's LAN IP and write it into the GSplatServerClient
-        /// serialized field so the Quest connects to the right address at runtime.
-        /// </summary>
-        static void ConfigureServerUrl()
-        {
-            var client = FindAny<GSplatServerClient>();
-            if (client == null) return;
-
-            string lanIp = GetLanIp();
-            if (string.IsNullOrEmpty(lanIp)) return;
-
-            string url = $"http://{lanIp}:8420";
-
-            var so = new SerializedObject(client);
-            var prop = so.FindProperty("serverUrl");
-            if (prop != null && prop.stringValue != url)
-            {
-                prop.stringValue = url;
-                so.ApplyModifiedProperties();
-                EditorUtility.SetDirty(client);
-                Debug.Log($"[RoomScanWizard] Server URL set to {url} (detected LAN IP: {lanIp})");
-            }
         }
 
         static string GetLanIp()

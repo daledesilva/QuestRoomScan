@@ -11,7 +11,15 @@
   "overrideReferences": false,
   "precompiledReferences": [],
   "autoReferenced": true,
-  "defineConstraints": [],
-  "versionDefines": [],
+  "defineConstraints": [
+    "HAS_GAUSSIAN_SPLATTING"
+  ],
+  "versionDefines": [
+    {
+      "name": "org.nesnausk.gaussian-splatting",
+      "expression": "",
+      "define": "HAS_GAUSSIAN_SPLATTING"
+    }
+  ],
   "noEngineReferences": false
 }

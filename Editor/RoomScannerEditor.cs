@@ -93,7 +93,7 @@ namespace Genesis.RoomScan.Editor
                 }
             }
 
-            // GSplat module — full setup via the wizard helper
+#if HAS_GAUSSIAN_SPLATTING
             bool hasGSplat = scanner.GetComponent<IGSplatProvider>() != null;
             var gsplatType = AppDomain.CurrentDomain.GetAssemblies()
                 .SelectMany(a => { try { return a.GetTypes(); } catch { return Type.EmptyTypes; } })
@@ -111,6 +111,7 @@ namespace Genesis.RoomScan.Editor
                         EditorUtility.SetDirty(scanner.gameObject);
                     });
             }
+#endif
 
             // Debug Menu — lives on a child GameObject with UIDocument
             bool hasDebugMenu = scanner.GetComponentInChildren<DebugMenuController>(true) != null;

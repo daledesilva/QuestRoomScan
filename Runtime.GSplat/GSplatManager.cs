@@ -9,14 +9,13 @@ namespace Genesis.RoomScan.GSplat
     /// via the Unity Gaussian Splatting (UGS) package's <see cref="GaussianSplatRenderer"/>
     /// on a dedicated child GameObject whose transform can be set for room-anchor relocation.
     /// </summary>
-    [RequireComponent(typeof(KeyframeCollector), typeof(PointCloudExporter))]
+    [RequireComponent(typeof(KeyframeCollector))]
     public class GSplatManager : MonoBehaviour, IRoomScanModule, IGSplatProvider
     {
         public string ModuleName => "Gaussian Splat";
 
         private RoomScanner _scanner;
         private GSplatServerClient _serverClient;
-        private PointCloudExporter _pointCloudExporter;
         GaussianSplatRenderer _ugsRenderer;
         Transform _splatHolder;
 
@@ -42,7 +41,6 @@ namespace Genesis.RoomScan.GSplat
         {
             _scanner = scanner;
             _serverClient = GetComponent<GSplatServerClient>();
-            _pointCloudExporter = GetComponent<PointCloudExporter>();
         }
 
         void Awake()
@@ -154,13 +152,19 @@ namespace Genesis.RoomScan.GSplat
         public async Task<byte[]> RunServerTrainingAsync(string keyframeDir, UnityEngine.Matrix4x4 keyframeRelocation)
         {
             if (_serverClient == null) return null;
-            if (_pointCloudExporter == null) return null;
 
-            Logger.Info("Exporting point cloud...");
-            await _pointCloudExporter.ExportAsync();
+            if (PointCloudExporter.ExistsIn(keyframeDir))
+            {
+                Logger.Info("Reusing existing point cloud from package");
+            }
+            else
+            {
+                Logger.Info("Exporting point cloud...");
+                await PointCloudExporter.ExportAsync(keyframeDir);
+            }
 
             Logger.Info("Uploading training data to PC server...");
-            bool uploaded = await _serverClient.UploadTrainingData(keyframeRelocation);
+            bool uploaded = await _serverClient.UploadTrainingData(keyframeDir, keyframeRelocation);
             if (!uploaded) { Logger.Error("Upload failed"); return null; }
 
             Logger.Info("Waiting for server training to complete...");
@@ -187,10 +191,10 @@ namespace Genesis.RoomScan.GSplat
             return await _serverClient.EnhanceMeshAsync(meshBin, smoothIterations, enablePlaneSnap: enablePlaneSnap);
         }
 
-        public async Task<bool> UploadTrainingDataAsync(UnityEngine.Matrix4x4 keyframeRelocation)
+        public async Task<bool> UploadTrainingDataAsync(string keyframeDir, UnityEngine.Matrix4x4 keyframeRelocation)
         {
             if (_serverClient == null) return false;
-            return await _serverClient.UploadTrainingData(keyframeRelocation);
+            return await _serverClient.UploadTrainingData(keyframeDir, keyframeRelocation);
         }
 
         // ── IGSplatProvider: server / training status ──

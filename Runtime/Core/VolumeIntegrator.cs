@@ -106,6 +106,25 @@ namespace Genesis.RoomScan
         private bool _frustumReady;
         private float _lastPruneTime;
 
+        // Coverage metrics
+        private ComputeKernelHelper _coverageKernel;
+        private ComputeBuffer _coverageCounters;
+        private int _integrationsSinceCoverage;
+        private bool _coverageReadbackPending;
+        private static readonly int CoverageCountersID = Shader.PropertyToID("_CoverageCounters");
+        private static readonly int ColorVolumeReadID = Shader.PropertyToID("gsColorVolumeRead");
+
+        [Header("Coverage Metrics")]
+        [Tooltip("Dispatch coverage count every N integrations (0 = disabled). Higher = less GPU overhead.")]
+        [SerializeField] private int coverageUpdateInterval = 30;
+
+        /// <summary>Number of voxels near the zero-crossing with sufficient weight (surface voxels).</summary>
+        public int SurfaceVoxelCount { get; private set; }
+        /// <summary>Number of surface voxels that are frozen (user-confirmed done).</summary>
+        public int FrozenSurfaceCount { get; private set; }
+        /// <summary>Number of surface voxels with camera color data (alpha &gt; 0.1).</summary>
+        public int ColoredSurfaceCount { get; private set; }
+
         /// <summary>
         /// Transforms whose positions define spherical exclusion zones; voxels near these are skipped during integration.
         /// </summary>
@@ -159,6 +178,12 @@ namespace Genesis.RoomScan
             _unfreezeKernel = new ComputeKernelHelper(compute, "UnfreezeInFrustum");
             _unfreezeKernel.Set(VolumeRWID, _volume);
 
+            _coverageKernel = new ComputeKernelHelper(compute, "CountSurfaceCoverage");
+            _coverageKernel.Set(VolumeRWID, _volume);
+            _coverageCounters = new ComputeBuffer(3, sizeof(uint));
+            _coverageKernel.Set(CoverageCountersID, _coverageCounters);
+            compute.SetTexture(_coverageKernel.KernelIndex, ColorVolumeReadID, _colorVolume);
+
             _dummyCamTex = new Texture2D(1, 1, TextureFormat.RGBA32, false);
             _dummyCamTex.SetPixel(0, 0, Color.black);
             _dummyCamTex.Apply(false, true);
@@ -172,11 +197,80 @@ namespace Genesis.RoomScan
 
         private void OnDestroy()
         {
-            _frustumVolume?.Release();
-            if (_volume) Destroy(_volume);
-            if (_colorVolume) Destroy(_colorVolume);
+            ReleaseVolumes();
+            _coverageCounters?.Release();
+            _coverageCounters = null;
             if (_camFrameCopy) Destroy(_camFrameCopy);
             if (_dummyCamTex) Destroy(_dummyCamTex);
+        }
+
+        /// <summary>
+        /// Destroys the TSDF + color volume RenderTextures and the frustum buffer to free GPU memory.
+        /// The component stays alive; calling <see cref="CreateVolume"/> + <see cref="SetShaderConstants"/>
+        /// re-allocates everything (handled transparently by the integration path).
+        /// </summary>
+        public void ReleaseVolumes()
+        {
+            _frustumVolume?.Release();
+            _frustumVolume = null;
+            _frustumReady = false;
+            if (_volume) { Destroy(_volume); _volume = null; }
+            if (_colorVolume) { Destroy(_colorVolume); _colorVolume = null; }
+            IntegrationCount = 0;
+            Logger.Info("VolumeIntegrator: GPU volumes released");
+        }
+
+        /// <summary>True when volumes have been released and need re-allocation before integration.</summary>
+        public bool VolumesReleased => _volume == null;
+
+        /// <summary>
+        /// Re-creates TSDF + color volumes after a prior <see cref="ReleaseVolumes"/> call.
+        /// </summary>
+        public void ReallocateVolumes()
+        {
+            if (_volume != null) return;
+            CreateVolume();
+            SetShaderConstants();
+            Clear();
+            RebindKernelTextures();
+            Logger.Info("VolumeIntegrator: GPU volumes re-allocated");
+        }
+
+        private void RebindKernelTextures()
+        {
+            _clearKernel.Set(VolumeRWID, _volume);
+            _clearKernel.Set(ColorVolumeRWID, _colorVolume);
+            _integrateKernel.Set(VolumeRWID, _volume);
+            _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
+            _pruneKernel.Set(VolumeRWID, _volume);
+            _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
+            _freezeKernel.Set(VolumeRWID, _volume);
+            _unfreezeKernel.Set(VolumeRWID, _volume);
+            _coverageKernel.Set(VolumeRWID, _volume);
+            compute.SetTexture(_coverageKernel.KernelIndex, ColorVolumeReadID, _colorVolume);
+        }
+
+        private void DispatchCoverageCount()
+        {
+            if (_volume == null || _coverageCounters == null) return;
+            _coverageReadbackPending = true;
+
+            uint[] zeros = { 0, 0, 0 };
+            _coverageCounters.SetData(zeros);
+            _coverageKernel.DispatchFit(_volume);
+
+            AsyncGPUReadback.Request(_coverageCounters, OnCoverageReadback);
+        }
+
+        private void OnCoverageReadback(AsyncGPUReadbackRequest request)
+        {
+            _coverageReadbackPending = false;
+            if (request.hasError) return;
+            var data = request.GetData<uint>();
+            if (data.Length < 3) return;
+            SurfaceVoxelCount = (int)data[0];
+            FrozenSurfaceCount = (int)data[1];
+            ColoredSurfaceCount = (int)data[2];
         }
 
         private void CreateVolume()
@@ -310,14 +404,7 @@ namespace Genesis.RoomScan
         private void RebindVolumeTextures()
         {
             if (_clearKernel.Shader == null) return;
-            _clearKernel.Set(VolumeRWID, _volume);
-            _clearKernel.Set(ColorVolumeRWID, _colorVolume);
-            _integrateKernel.Set(VolumeRWID, _volume);
-            _integrateKernel.Set(ColorVolumeRWID, _colorVolume);
-            _pruneKernel.Set(VolumeRWID, _volume);
-            _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
-            _freezeKernel.Set(VolumeRWID, _volume);
-            _unfreezeKernel.Set(VolumeRWID, _volume);
+            RebindKernelTextures();
         }
 
         /// <summary>
@@ -530,6 +617,16 @@ namespace Genesis.RoomScan
                 _pruneKernel.Set(VolumeRWID, _volume);
                 _pruneKernel.Set(ColorVolumeRWID, _colorVolume);
                 _pruneKernel.DispatchFit(_volume);
+            }
+
+            if (coverageUpdateInterval > 0 && !_coverageReadbackPending)
+            {
+                _integrationsSinceCoverage++;
+                if (_integrationsSinceCoverage >= coverageUpdateInterval)
+                {
+                    _integrationsSinceCoverage = 0;
+                    DispatchCoverageCount();
+                }
             }
 
             Integrated?.Invoke();

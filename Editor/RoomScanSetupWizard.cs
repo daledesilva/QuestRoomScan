@@ -38,7 +38,6 @@ namespace Genesis.RoomScan.Editor
         TriplanarCache _triplanarCache;
         RoomScanPersistence _persistence;
         KeyframeCollector _keyframeCollector;
-        PointCloudExporter _pointCloudExporter;
         GSplatManager _gsplatManager;
         GaussianSplatRenderer _ugsRenderer;
         GSplatServerClient _gsplatServerClient;
@@ -50,6 +49,8 @@ namespace Genesis.RoomScan.Editor
         VRDocumentRaycaster _vrRaycaster;
         ControllerRayDriver _rayDriver;
         PanelInputConfiguration _panelInputConfig;
+
+        TextureRefinement _textureRefinement;
 
         bool _depthCaptureWired, _volumeWired, _meshMatWired, _triplanarWired, _computeShaderWired;
         bool _refinedShaderWired, _atlasBakeComputeWired;
@@ -122,7 +123,6 @@ namespace Genesis.RoomScan.Editor
             _triplanarCache = FindAny<TriplanarCache>();
             _persistence = FindAny<RoomScanPersistence>();
             _keyframeCollector = FindAny<KeyframeCollector>();
-            _pointCloudExporter = FindAny<PointCloudExporter>();
             _gsplatManager = FindAny<GSplatManager>();
             _ugsRenderer = FindAny<GaussianSplatRenderer>();
             _gsplatServerClient = FindAny<GSplatServerClient>();
@@ -135,6 +135,8 @@ namespace Genesis.RoomScan.Editor
             _rayDriver = FindAny<ControllerRayDriver>();
             _panelInputConfig = FindAny<PanelInputConfiguration>();
 
+            _textureRefinement = _roomScanner != null ? _roomScanner.GetComponent<TextureRefinement>() : null;
+
             _depthCaptureWired = _depthCapture != null && AreFieldsAssigned(_depthCapture,
                 "depthNormalCompute", "depthDilationCompute", "bilateralFilterCompute");
             _volumeWired = _volumeIntegrator != null && AreFieldsAssigned(_volumeIntegrator,
@@ -145,7 +147,6 @@ namespace Genesis.RoomScan.Editor
                 "bakeCompute");
             _computeShaderWired = _meshExtractor != null && AreFieldsAssigned(_meshExtractor,
                 "surfaceNetsCompute");
-            var _textureRefinement = _roomScanner != null ? _roomScanner.GetComponent<TextureRefinement>() : null;
             _refinedShaderWired = _textureRefinement != null && AreFieldsAssigned(_textureRefinement,
                 "refinedMeshShader");
             _atlasBakeComputeWired = _textureRefinement != null && AreFieldsAssigned(_textureRefinement,
@@ -574,7 +575,6 @@ namespace Genesis.RoomScan.Editor
             StatusRowOptional("PassthroughCameraAccess", _pcaComponent != null);
             StatusRowOptional("TriplanarCache", _triplanarCache != null);
             StatusRowOptional("KeyframeCollector", _keyframeCollector != null);
-            StatusRowOptional("PointCloudExporter", _pointCloudExporter != null);
             StatusRowOptional("GSplatManager (Gaussian Splat)", _gsplatManager != null);
             StatusRowOptional("GaussianSplatRenderer (UGS)", _ugsRenderer != null);
             StatusRowOptional("GSplatServerClient (PC training)", _gsplatServerClient != null);
@@ -616,31 +616,11 @@ namespace Genesis.RoomScan.Editor
 
             EndSection();
 
-            // ── VR Input Infrastructure ──
-            BeginSection("VR INPUT INFRASTRUCTURE");
-            StatusRow("EventSystem + OVRInputModule", _eventSystem != null && _ovrInputModule != null);
-            StatusRow("VRDocumentRaycaster (UI pointer)", _vrRaycaster != null);
-            StatusRow("ControllerRayDriver (laser)", _rayDriver != null);
-            StatusRow("PanelInputConfiguration", _panelInputConfig != null);
+            // ── Game-Ready Preset ──
+            DrawGameReadyPreset();
 
-            bool inputMissing = _eventSystem == null || _ovrInputModule == null ||
-                                _vrRaycaster == null || _rayDriver == null ||
-                                _panelInputConfig == null;
-            if (inputMissing)
-            {
-                GUILayout.Space(2);
-                EditorGUILayout.BeginHorizontal();
-                GUILayout.FlexibleSpace();
-                if (GUILayout.Button("Setup VR Input", GUILayout.Width(160)))
-                {
-                    EnsureVRInputInfrastructure();
-                    MarkDirty();
-                    Refresh();
-                }
-                EditorGUILayout.EndHorizontal();
-            }
-
-            EndSection();
+            // ── Debug Preset ──
+            DrawDebugPreset();
         }
 
         GameObject FindOrCreateRoot()
@@ -699,9 +679,6 @@ namespace Genesis.RoomScan.Editor
                 Undo.AddComponent<TriplanarCache>(root);
             if (root.GetComponent<TextureRefinement>() == null)
                 Undo.AddComponent<TextureRefinement>(root);
-            if (root.GetComponent<PointCloudExporter>() == null)
-                Undo.AddComponent<PointCloudExporter>(root);
-
             // GSplat module (separate assembly)
             SetupGSplatModule(root);
 
@@ -750,6 +727,186 @@ namespace Genesis.RoomScan.Editor
         {
             FixCoreComponents();
             FixAllOptionalModules();
+        }
+
+        // -- Game-Ready Preset ----------------------------------------------
+
+        void DrawGameReadyPreset()
+        {
+            BeginSection("GAME-READY PRESET");
+            EditorGUILayout.HelpBox(
+                "Lightweight module set for game integration: scan \u2192 refine \u2192 release GPU \u2192 play. " +
+                "Skips TriplanarCache, Gaussian Splat, and debug tools to save GPU and keep the build lean.",
+                MessageType.Info);
+
+            bool hasPCA = _pcaComponent != null;
+            bool hasPCAProvider = _cameraProvider != null;
+            bool hasRefinement = _textureRefinement != null;
+
+            StatusRowOptional("PassthroughCameraAccess (camera RGB)", hasPCA);
+            StatusRowOptional("PassthroughCameraProvider", hasPCAProvider);
+            StatusRowOptional("TextureRefinement (atlas baking)", hasRefinement);
+
+            if (hasRefinement)
+            {
+                var so = new SerializedObject(_textureRefinement);
+                var simplifyProp = so.FindProperty("postBakeSimplificationRatio");
+                if (simplifyProp != null)
+                {
+                    float val = simplifyProp.floatValue;
+                    bool configured = val < 1f;
+                    StatusRowOptional($"Post-bake simplification ({val:P0})", configured);
+                }
+            }
+
+            bool triplanarAttached = _triplanarCache != null;
+            if (triplanarAttached)
+            {
+                var prev = GUI.color;
+                GUI.color = COL_WARN;
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.Space(12);
+                GUILayout.Label("\u26A0", EditorStyles.boldLabel, GUILayout.Width(18));
+                GUI.color = prev;
+                GUILayout.Label("TriplanarCache is attached (\u2212240 MB GPU if removed)", GUILayout.ExpandWidth(true));
+                prev = GUI.color;
+                GUI.color = COL_WARN;
+                GUILayout.Label("Optional", EditorStyles.miniLabel, GUILayout.Width(60));
+                GUI.color = prev;
+                EditorGUILayout.EndHorizontal();
+            }
+
+            bool gameReadyMissing = !hasPCA || !hasPCAProvider || !hasRefinement;
+            if (gameReadyMissing)
+            {
+                GUILayout.Space(2);
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Add Game-Ready Modules", GUILayout.Width(200)))
+                    FixGameReadyModules();
+                EditorGUILayout.EndHorizontal();
+            }
+
+            EndSection();
+        }
+
+        void DrawDebugPreset()
+        {
+            BeginSection("DEBUG PRESET");
+            EditorGUILayout.HelpBox(
+                "Development tools: debug HUD, input handler, camera/depth overlays, " +
+                "and VR input pipeline for interacting with the debug menu. " +
+                "Overlays are added disabled by default.",
+                MessageType.Info);
+
+            bool hasInput = _inputHandler != null;
+            bool hasDebug = _debugMenu != null;
+            bool hasCamOverlay = _cameraDebug != null;
+            bool hasDepthOverlay = _depthDebug != null;
+
+            StatusRowOptional("RoomScanInputHandler (VR controls)", hasInput);
+            StatusRowOptional("DebugMenuController (HUD)", hasDebug);
+            StatusRowOptional("CameraDebugOverlay (disabled)", hasCamOverlay);
+            StatusRowOptional("DepthDebugOverlay (disabled)", hasDepthOverlay);
+
+            GUILayout.Space(4);
+            EditorGUILayout.LabelField("VR Input (for debug menu buttons)", EditorStyles.miniLabel);
+            StatusRowOptional("EventSystem + OVRInputModule", _eventSystem != null && _ovrInputModule != null);
+            StatusRowOptional("VRDocumentRaycaster (UI pointer)", _vrRaycaster != null);
+            StatusRowOptional("ControllerRayDriver (laser + cursor)", _rayDriver != null);
+            StatusRowOptional("PanelInputConfiguration", _panelInputConfig != null);
+
+            bool debugMissing = !hasInput || !hasDebug || !hasCamOverlay || !hasDepthOverlay
+                                || _eventSystem == null || _ovrInputModule == null
+                                || _vrRaycaster == null || _rayDriver == null
+                                || _panelInputConfig == null;
+            if (debugMissing)
+            {
+                GUILayout.Space(2);
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Add Debug Modules", GUILayout.Width(200)))
+                    FixDebugModules();
+                EditorGUILayout.EndHorizontal();
+            }
+
+            EndSection();
+        }
+
+        void FixGameReadyModules()
+        {
+            var root = FindOrCreateRoot();
+
+            if (root.GetComponent<RoomScanner>() == null)
+                Undo.AddComponent<RoomScanner>(root);
+
+            if (root.GetComponent<PassthroughCameraAccess>() == null)
+                Undo.AddComponent<PassthroughCameraAccess>(root);
+            if (root.GetComponent<PassthroughCameraProvider>() == null)
+                Undo.AddComponent<PassthroughCameraProvider>(root);
+
+            if (root.GetComponent<TextureRefinement>() == null)
+                Undo.AddComponent<TextureRefinement>(root);
+
+            var tr = root.GetComponent<TextureRefinement>();
+            if (tr != null)
+            {
+                var so = new SerializedObject(tr);
+                var simplifyProp = so.FindProperty("postBakeSimplificationRatio");
+                if (simplifyProp != null && simplifyProp.floatValue >= 1f)
+                {
+                    simplifyProp.floatValue = 0.5f;
+                    so.ApplyModifiedProperties();
+                    EditorUtility.SetDirty(tr);
+                    Debug.Log("[RoomScan Setup] Set postBakeSimplificationRatio to 0.5 for game-ready mesh");
+                }
+            }
+
+            foreach (var c in root.GetComponents<Component>())
+                WireComponent(c);
+
+            MarkDirty();
+            Refresh();
+        }
+
+        void FixDebugModules()
+        {
+            var root = FindOrCreateRoot();
+
+            if (root.GetComponent<RoomScanner>() == null)
+                Undo.AddComponent<RoomScanner>(root);
+
+            if (root.GetComponent<RoomScanInputHandler>() == null)
+                Undo.AddComponent<RoomScanInputHandler>(root);
+
+            if (root.GetComponent<CameraDebugOverlay>() == null)
+            {
+                var c = Undo.AddComponent<CameraDebugOverlay>(root);
+                c.enabled = false;
+            }
+            if (root.GetComponent<DepthDebugOverlay>() == null)
+            {
+                var c = Undo.AddComponent<DepthDebugOverlay>(root);
+                c.enabled = false;
+            }
+
+            if (FindAny<DebugMenuController>() == null)
+            {
+                var debugGo = new GameObject("DebugMenu");
+                debugGo.transform.SetParent(root.transform);
+                Undo.RegisterCreatedObjectUndo(debugGo, "Create DebugMenu");
+                Undo.AddComponent<UIDocument>(debugGo);
+                Undo.AddComponent<DebugMenuController>(debugGo);
+            }
+            EnsureDebugMenuAssets();
+
+            foreach (var c in root.GetComponents<Component>())
+                WireComponent(c);
+
+            EnsureVRInputInfrastructure();
+
+            MarkDirty();
+            Refresh();
         }
 
         /// <summary>
@@ -815,9 +972,8 @@ namespace Genesis.RoomScan.Editor
             // Optional — only show if the module is attached
             if (_triplanarCache != null) { StatusRow("TriplanarCache bake compute", _triplanarWired);      needsFix |= !_triplanarWired; }
 
-            var textureRefine = _roomScanner != null ? _roomScanner.GetComponent<TextureRefinement>() : null;
-            if (textureRefine != null)   { StatusRow("RefinedMesh shader (texture refine)", _refinedShaderWired); needsFix |= !_refinedShaderWired; }
-            if (textureRefine != null)   { StatusRow("AtlasBakeCompute (GPU bake)", _atlasBakeComputeWired);      needsFix |= !_atlasBakeComputeWired; }
+            if (_textureRefinement != null)   { StatusRow("RefinedMesh shader (texture refine)", _refinedShaderWired); needsFix |= !_refinedShaderWired; }
+            if (_textureRefinement != null)   { StatusRow("AtlasBakeCompute (GPU bake)", _atlasBakeComputeWired);      needsFix |= !_atlasBakeComputeWired; }
 
             if (_ugsRenderer != null)    { StatusRow("UGS renderer shaders + compute", _ugsRendererWired);        needsFix |= !_ugsRendererWired; }
             if (_ugsRenderer != null)    { StatusRow("UGS RenderFeature on URP Renderer", _ugsRenderFeatureAdded); needsFix |= !_ugsRenderFeatureAdded; }

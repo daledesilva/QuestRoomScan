@@ -25,6 +25,7 @@ namespace Genesis.RoomScan.UI
 
         // Scan view elements
         private Label _valScanning, _valIntegrations, _valKeyframes, _valRender, _valPackage;
+        private Label _valProgress, _valPhase, _valColorCoverage, _valFrozen, _valMeshStats;
         private Button _btnToggleScan, _btnRenderMode, _btnFreezeTint, _btnSaveScan, _btnDeleteArtifact;
 
         // Saved scans view
@@ -33,6 +34,7 @@ namespace Genesis.RoomScan.UI
 
         // Refine view
         private Label _valRefineStatus, _valHqStatus, _valMeshEnhanceStatus;
+        private Label _valRefinedMeshStats, _valSimplifiedMeshStats;
         private Button _btnRefineTex, _btnHqRefine, _btnMeshEnhance;
 
         // Training view
@@ -149,6 +151,11 @@ namespace Genesis.RoomScan.UI
             _valKeyframes = _root.Q<Label>("val-keyframes");
             _valRender = _root.Q<Label>("val-render");
             _valPackage = _root.Q<Label>("val-package");
+            _valProgress = _root.Q<Label>("val-progress");
+            _valPhase = _root.Q<Label>("val-phase");
+            _valColorCoverage = _root.Q<Label>("val-color-coverage");
+            _valFrozen = _root.Q<Label>("val-frozen");
+            _valMeshStats = _root.Q<Label>("val-mesh-stats");
             _btnToggleScan = _root.Q<Button>("btn-toggle-scan");
             _btnRenderMode = _root.Q<Button>("btn-render-mode");
             _btnFreezeTint = _root.Q<Button>("btn-freeze-tint");
@@ -163,6 +170,8 @@ namespace Genesis.RoomScan.UI
             _valRefineStatus = _root.Q<Label>("val-refine-status");
             _valHqStatus = _root.Q<Label>("val-hq-status");
             _valMeshEnhanceStatus = _root.Q<Label>("val-mesh-enhance-status");
+            _valRefinedMeshStats = _root.Q<Label>("val-refined-mesh-stats");
+            _valSimplifiedMeshStats = _root.Q<Label>("val-simplified-mesh-stats");
             _btnRefineTex = _root.Q<Button>("btn-refine-tex");
             _btnHqRefine = _root.Q<Button>("btn-hq-refine");
             _btnMeshEnhance = _root.Q<Button>("btn-mesh-enhance");
@@ -467,6 +476,16 @@ namespace Genesis.RoomScan.UI
             var kf = FindAnyObjectByType<KeyframeCollector>();
             if (kf != null) SetLabel(_valKeyframes, kf.SavedCount.ToString());
 
+            var progress = scanner.CurrentProgress;
+            var cov = progress.Coverage;
+            SetLabel(_valProgress, $"{progress.OverallProgress:P0}");
+            SetLabel(_valPhase, progress.Phase.ToString());
+            SetLabel(_valColorCoverage, $"{cov.ColorCoverage:P0}");
+            SetLabel(_valFrozen, $"{cov.FrozenFraction:P0}");
+            SetLabel(_valMeshStats, cov.MeshVertexCount > 0
+                ? $"{cov.MeshVertexCount / 1000f:F1}K verts, {cov.MeshTriangleCount / 1000f:F1}K tris"
+                : "--");
+
             // Delete artifact button visibility
             if (_btnDeleteArtifact != null)
             {
@@ -540,6 +559,28 @@ namespace Genesis.RoomScan.UI
             }
             SetLabel(_valMeshEnhanceStatus, scanner.IsMeshEnhancing
                 ? (scanner.MeshEnhanceStatus ?? "Processing...") : "Idle");
+
+            if (scanner.LastRefinedResult.HasValue)
+            {
+                var r = scanner.LastRefinedResult.Value;
+                SetLabel(_valRefinedMeshStats,
+                    $"{r.Positions.Length / 1000f:F1}K verts, {r.Indices.Length / 3 / 1000f:F1}K tris");
+            }
+            else
+            {
+                SetLabel(_valRefinedMeshStats, "--");
+            }
+
+            if (scanner.LastSimplifiedResult.HasValue)
+            {
+                var s = scanner.LastSimplifiedResult.Value;
+                SetLabel(_valSimplifiedMeshStats,
+                    $"{s.Positions.Length / 1000f:F1}K verts, {s.Indices.Length / 3 / 1000f:F1}K tris");
+            }
+            else
+            {
+                SetLabel(_valSimplifiedMeshStats, "--");
+            }
         }
 
         private void RefreshTrainingStatus()
@@ -582,9 +623,9 @@ namespace Genesis.RoomScan.UI
             bool hasVolume = vi != null && vi.IntegrationCount > 0;
             bool hasActivePackage = persistence != null && persistence.HasActivePackage;
 
-            // Save Scan: disabled if no volume data
+            // Save Scan: disabled if no volume data or while scanning
             if (_btnSaveScan != null && !_btnSaveScan.text.Contains("..."))
-                _btnSaveScan.SetEnabled(hasVolume);
+                _btnSaveScan.SetEnabled(hasVolume && !scanner.IsScanning);
 
             // GS Training: entirely disabled if module absent
             if (_btnGsTrain != null)

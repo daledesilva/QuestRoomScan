@@ -3,6 +3,7 @@ using System.IO;
 using System.Threading.Tasks;
 using Genesis.RoomScan.UI;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace Genesis.RoomScan
 {
@@ -26,6 +27,57 @@ namespace Genesis.RoomScan
         None,
         /// <summary>Live GPU mesh wireframe via barycentric edge detection.</summary>
         Wireframe
+    }
+
+    /// <summary>High-level phase of the scanning session.</summary>
+    public enum ScanPhase
+    {
+        /// <summary>Before <see cref="RoomScanner.StartScanning"/> is called.</summary>
+        NotStarted,
+        /// <summary>New geometry appearing rapidly — early scan.</summary>
+        Discovering,
+        /// <summary>Geometry mostly stable, color/frozen coverage still filling in.</summary>
+        Refining,
+        /// <summary>Both geometry and color have plateaued.</summary>
+        Stabilized,
+        /// <summary>Plateaued long enough to consider the scan ready for refinement.</summary>
+        Complete
+    }
+
+    /// <summary>Raw scan coverage metrics. Updated periodically during scanning.</summary>
+    public struct ScanCoverage
+    {
+        /// <summary>Total depth frames fused so far.</summary>
+        public int IntegrationCount;
+        /// <summary>Current GPU mesh vertex count.</summary>
+        public int MeshVertexCount;
+        /// <summary>Current GPU mesh triangle count (indices / 3).</summary>
+        public int MeshTriangleCount;
+        /// <summary>Voxels near the zero-crossing with sufficient weight.</summary>
+        public int SurfaceVoxelCount;
+        /// <summary>Frozen surface voxels (user-confirmed done areas).</summary>
+        public int FrozenSurfaceCount;
+        /// <summary>Surface voxels with camera RGB data.</summary>
+        public int ColoredSurfaceCount;
+        /// <summary>Colored / Surface ratio (0–1).</summary>
+        public float ColorCoverage;
+        /// <summary>Frozen / Surface ratio (0–1). Strongest "done" signal.</summary>
+        public float FrozenFraction;
+        /// <summary>Number of captured keyframes so far.</summary>
+        public int KeyframeCount;
+        /// <summary>True when mesh vertex count has plateaued for several cycles.</summary>
+        public bool IsStabilized;
+    }
+
+    /// <summary>High-level scan progress combining raw metrics into a single progress value and phase.</summary>
+    public struct ScanProgress
+    {
+        /// <summary>The underlying raw coverage metrics.</summary>
+        public ScanCoverage Coverage;
+        /// <summary>Blended 0–1 overall progress (frozen fraction weighted heaviest).</summary>
+        public float OverallProgress;
+        /// <summary>Current high-level scan phase.</summary>
+        public ScanPhase Phase;
     }
 
     /// <summary>
@@ -69,7 +121,6 @@ namespace Genesis.RoomScan
         private PassthroughCameraProvider _cameraProvider;
         private TriplanarCache _triplanarCache;
         private KeyframeCollector _keyframeCollector;
-        private PointCloudExporter _pointCloudExporter;
         private IGSplatProvider _gsplatProvider;
         private TextureRefinement _textureRefinement;
         private DebugMenuController _debugMenu;
@@ -112,6 +163,8 @@ namespace Genesis.RoomScan
         public event Action ScanStarted;
         public event Action ScanStopped;
         public event Action<ScanRenderMode> RenderModeChanged;
+        /// <summary>Raised when a refined mesh + atlas becomes available (after refinement or package load).</summary>
+        public event Action<Mesh, Texture2D> RefinedMeshReady;
 
         /// <summary>
         /// Raised each frame a passthrough camera frame is fed to the volume integrator.
@@ -132,6 +185,18 @@ namespace Genesis.RoomScan
         private float _lastMeshTime;
         private bool _started;
         private bool _serverTrainingInProgress;
+        private bool _scanResourcesReleased;
+
+        // Plateau detection state
+        private int _prevVertexCount;
+        private int _stableVertexCycles;
+        private int _stableColorCycles;
+        private float _prevColorCoverage;
+        private float _stabilizedTime;
+        private const int StableThresholdCycles = 5;
+        private const float StabilizedHoldSeconds = 3f;
+        private const float VertexGrowthThreshold = 0.02f; // 2% change considered growth
+        private const float ColorGrowthThreshold = 0.01f;  // 1% change
 
         // ─────────────────────────────────────────────────────────────
         //  Texture refinement state
@@ -154,10 +219,33 @@ namespace Genesis.RoomScan
         public string HQRefineStatus { get; private set; }
         public string MeshEnhanceStatus { get; private set; }
 
+        /// <summary>Current scan coverage metrics (updated periodically during scanning).</summary>
+        public ScanCoverage CurrentCoverage => BuildCoverage();
+        /// <summary>High-level scan progress with blended overall progress and phase.</summary>
+        public ScanProgress CurrentProgress => BuildProgress();
+
+        /// <summary>The UV-unwrapped refined mesh (null until refinement completes or a refined package is loaded).</summary>
+        public Mesh RefinedMesh => _refinedMesh;
+        /// <summary>The on-device baked texture atlas (null until refinement completes or a refined package is loaded).</summary>
+        public Texture2D RefinedAtlas => _refinedAtlasTexture;
+        /// <summary>The server-enhanced HQ atlas, or null if not available.</summary>
+        public Texture2D HQAtlas => _hqAtlasTexture;
+
         /// <summary>
-        /// Shared UV mesh data used by persistence to save/restore refinement results.
+        /// The original (unsimplified) refined mesh data. Always preserved across re-refines.
+        /// Used as the source-of-truth for re-refinement and UV reconstruction.
         /// </summary>
         internal RefinedTextureResult? LastRefinedResult { get; set; }
+
+        /// <summary>
+        /// The post-bake simplified mesh (if simplification was applied). Null when
+        /// postBakeSimplificationRatio >= 1 or simplification hasn't run.
+        /// This is what gets rendered and saved, but re-refinement always uses LastRefinedResult.
+        /// </summary>
+        internal RefinedTextureResult? LastSimplifiedResult { get; set; }
+
+        /// <summary>Whether a simplified version of the refined mesh exists.</summary>
+        public bool HasSimplifiedMesh => LastSimplifiedResult.HasValue;
 
         /// <summary>
         /// Relocation matrix from the last scan load. Transforms old-session world-space
@@ -220,7 +308,6 @@ namespace Genesis.RoomScan
             _triplanarCache = GetComponent<TriplanarCache>();
             _persistence = GetComponent<RoomScanPersistence>();
             _keyframeCollector = GetComponent<KeyframeCollector>();
-            _pointCloudExporter = GetComponent<PointCloudExporter>();
             _gsplatProvider = GetComponent<IGSplatProvider>();
             _textureRefinement = GetComponent<TextureRefinement>();
             _debugMenu = GetComponentInChildren<DebugMenuController>();
@@ -258,18 +345,9 @@ namespace Genesis.RoomScan
                 if (_meshExtractor != null && !_meshExtractor.IsInitialized)
                     _meshExtractor.Reinitialize();
 
-                if (_keyframeCollector != null)
-                    _keyframeCollector.ReinitExportDir();
                 Logger.Info("All scan + export data cleared");
                 _clearDoneCallback?.Invoke();
                 _clearDoneCallback = null;
-            }
-
-            if (_reinitExportPending)
-            {
-                _reinitExportPending = false;
-                if (_keyframeCollector != null)
-                    _keyframeCollector.ReinitExportDir();
             }
 
             // Enforce triplanar override every frame (not just while scanning)
@@ -294,6 +372,7 @@ namespace Genesis.RoomScan
                 {
                     _lastMeshTime = t;
                     _meshExtractor.Extract();
+                    UpdatePlateauDetection();
                     MeshExtracted?.Invoke();
                 }
             }
@@ -322,36 +401,35 @@ namespace Genesis.RoomScan
             _cachedUnwrap = null;
             if (_persistence != null) _persistence.ClearActivePackage();
 
-            if (_keyframeCollector != null)
+            if (_scanResourcesReleased)
             {
-                _keyframeCollector.ClearInMemory();
-                if (_pointCloudExporter != null)
-                    _pointCloudExporter.ResetTimer();
-                string gsExportDir = Path.Combine(Application.persistentDataPath, "GSExport");
-                System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    try
-                    {
-                        if (Directory.Exists(gsExportDir))
-                            Directory.Delete(gsExportDir, true);
-                    }
-                    catch (Exception e)
-                    {
-                        Logger.Error($"StartScanning clear error: {e.Message}");
-                    }
-                    finally
-                    {
-                        _reinitExportPending = true;
-                    }
-                });
+                _volumeIntegrator.ReallocateVolumes();
+                _meshExtractor.Reinitialize();
+                _scanResourcesReleased = false;
             }
+
+            _prevVertexCount = 0;
+            _stableVertexCycles = 0;
+            _stableColorCycles = 0;
+            _prevColorCoverage = 0f;
+            _stabilizedTime = 0f;
+
+            if (_keyframeCollector != null)
+                _keyframeCollector.ClearInMemory();
+
+            _persistence.CreateTmpPackage();
+            _keyframeCollector?.SetExportDirectory(
+                Path.Combine(_persistence.ActivePackageDirectory, "keyframes"));
 
             float t = Time.time;
             _lastIntegrationTime = t;
             _lastMeshTime = t;
 
+            _cameraAvailable = false;
+
             ICameraProvider provider = GetActiveCameraProvider();
             provider?.StartCapture();
+            _depthCapture.StartDepthCapture();
 
             Logger.Info($"StartScanning — integrationCount={_volumeIntegrator.IntegrationCount}");
             ScanStarted?.Invoke();
@@ -369,16 +447,46 @@ namespace Genesis.RoomScan
 
             ICameraProvider provider = GetActiveCameraProvider();
             provider?.StopCapture();
+            _depthCapture.StopDepthCapture();
 
             ScanStopped?.Invoke();
             if (_modules != null)
                 foreach (var m in _modules) m.OnScanStopped();
         }
 
+        /// <summary>Toggles between <see cref="StartScanning"/> and <see cref="StopScanning"/>.</summary>
         public void ToggleScanning()
         {
             if (IsScanning) StopScanning();
             else StartScanning();
+        }
+
+        /// <summary>True after <see cref="ReleaseScanResources"/> has been called. Cleared when scanning restarts.</summary>
+        public bool ScanResourcesReleased => _scanResourcesReleased;
+
+        /// <summary>
+        /// Frees heavy GPU resources (TSDF volumes, Surface Nets buffers, depth textures) to reclaim
+        /// ~400-500 MB of GPU memory. Call after scanning + refinement is complete, before entering gameplay.
+        /// The refined MeshRenderer stays alive for game-phase rendering.
+        /// Call <see cref="StartScanning"/> to re-allocate everything if a new scan is needed.
+        /// </summary>
+        public void ReleaseScanResources()
+        {
+            if (_scanResourcesReleased) return;
+            StopScanning();
+
+            _volumeIntegrator.ReleaseVolumes();
+            _meshExtractor.DisposeOnly();
+            _depthCapture.ReleaseResources();
+
+            if (_triplanarCache != null) _triplanarCache.Clear();
+
+            _scanResourcesReleased = true;
+
+            if (renderMode is ScanRenderMode.Vertex or ScanRenderMode.Wireframe or ScanRenderMode.Triplanar)
+                SetRenderMode(HasRefinedTexture ? ScanRenderMode.Refined : ScanRenderMode.None);
+
+            Logger.Info("Scan GPU resources released (~400-500 MB freed)");
         }
 
         /// <summary>
@@ -395,7 +503,7 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// Clears all persisted data: in-memory scan, saved scan files, triplanar
-        /// textures, and GSExport (keyframes + point cloud). Safe to call at runtime.
+        /// textures, and temporary package. Safe to call at runtime.
         /// File I/O runs on a background thread via ThreadPool to avoid main-thread
         /// stalls and potential SynchronizationContext deadlocks on Quest/IL2CPP.
         /// GPU resources are disposed without immediate re-allocation to avoid
@@ -406,8 +514,6 @@ namespace Genesis.RoomScan
         {
             if (_clearInProgress) return;
             _clearInProgress = true;
-
-            string gsExportDir = Path.Combine(Application.persistentDataPath, "GSExport");
 
             try
             {
@@ -420,6 +526,7 @@ namespace Genesis.RoomScan
                 HasHQRefinedTexture = false;
                 HasEnhancedMesh = false;
                 LastRefinedResult = null;
+                LastSimplifiedResult = null;
                 _cachedUnwrap = null;
                 _refinedMesh = null;
 
@@ -431,7 +538,11 @@ namespace Genesis.RoomScan
                 if (_keyframeCollector != null)
                     _keyframeCollector.ClearInMemory();
 
-                if (_persistence != null) _persistence.ClearActivePackage();
+                if (_persistence != null)
+                {
+                    _persistence.CleanupTmpPackage();
+                    _persistence.ClearActivePackage();
+                }
             }
             catch (Exception e)
             {
@@ -440,28 +551,12 @@ namespace Genesis.RoomScan
                 return;
             }
 
-            System.Threading.ThreadPool.QueueUserWorkItem(_ =>
-            {
-                try
-                {
-                    if (Directory.Exists(gsExportDir))
-                        Directory.Delete(gsExportDir, true);
-                }
-                catch (Exception e)
-                {
-                    Logger.Error($"ClearAllData I/O error: {e.Message}");
-                }
-                finally
-                {
-                    _clearDoneCallback = onComplete;
-                    _clearDone = true;
-                }
-            });
+            _clearDoneCallback = onComplete;
+            _clearDone = true;
         }
 
         private volatile bool _clearInProgress;
         private volatile bool _clearDone;
-        private volatile bool _reinitExportPending;
         private Action _clearDoneCallback;
 
         /// <summary>
@@ -515,10 +610,10 @@ namespace Genesis.RoomScan
         {
             return mode switch
             {
-                ScanRenderMode.Vertex => true,
-                ScanRenderMode.Wireframe => true,
+                ScanRenderMode.Vertex => !_scanResourcesReleased,
+                ScanRenderMode.Wireframe => !_scanResourcesReleased,
                 ScanRenderMode.None => true,
-                ScanRenderMode.Triplanar => _triplanarCache != null,
+                ScanRenderMode.Triplanar => !_scanResourcesReleased && _triplanarCache != null,
                 ScanRenderMode.Refined => HasRefinedTexture,
                 ScanRenderMode.HQRefined => HasHQRefinedTexture,
                 ScanRenderMode.Splat => (_gsplatProvider != null && _gsplatProvider.HasServerTrainedSplats) || HasDownloadedSplat,
@@ -554,11 +649,20 @@ namespace Genesis.RoomScan
 
         /// <summary>
         /// Persists the current scan (TSDF volume, keyframes, artifacts) to a new package on disk.
+        /// Returns false if scanning is active — stop scanning before saving.
         /// </summary>
         public async Task<bool> SaveScanAsync()
         {
             if (_persistence == null) return false;
-            return await _persistence.SaveToNewPackageAsync();
+            if (IsScanning)
+            {
+                Logger.Warning("Cannot save while scanning — stop scan first");
+                return false;
+            }
+            bool ok = await _persistence.SaveToNewPackageAsync();
+            if (ok && _keyframeCollector != null)
+                _keyframeCollector.SetExportDirectory(KeyframeDirectory);
+            return ok;
         }
 
         /// <summary>
@@ -571,13 +675,20 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Exports the current keyframe point cloud to disk via <see cref="PointCloudExporter"/>.
+        /// Lightweight load path: reads only the refined mesh + atlas from a saved package,
+        /// skipping TSDF reconstruction, Surface Nets, and triplanar data. Ideal for game-mode
+        /// sessions where only the baked mesh is needed. Typically completes in under 1 second.
         /// </summary>
-        public async Task ExportPointCloudAsync()
+        public async Task<bool> LoadRefinedOnlyAsync(string pkgId)
         {
-            if (_pointCloudExporter != null)
-                await _pointCloudExporter.ExportAsync();
+            if (_persistence == null) return false;
+            return await _persistence.LoadRefinedOnlyAsync(pkgId);
         }
+
+        /// <summary>
+        /// Exports the current GPU mesh as a PLY point cloud to the active keyframe directory.
+        /// </summary>
+        public Task ExportPointCloudAsync() => PointCloudExporter.ExportAsync(KeyframeDirectory);
 
         /// <summary>
         /// Kicks off the server-side Gaussian Splat training pipeline. Downloads the trained PLY on completion.
@@ -588,6 +699,7 @@ namespace Genesis.RoomScan
             RunServerTrainingAsync();
         }
 
+        /// <summary>Shows or hides the debug menu HUD if present.</summary>
         public void ToggleDebugMenu()
         {
             if (_debugMenu != null) _debugMenu.Toggle();
@@ -647,7 +759,7 @@ namespace Genesis.RoomScan
                 byte[] atlasPixels = await _textureRefinement.BakeAtlasAsync(
                     unwrap, keyframeDir, KeyframeRelocation);
 
-                var result = new RefinedTextureResult
+                var original = new RefinedTextureResult
                 {
                     Positions = unwrap.Positions,
                     Normals = unwrap.Normals,
@@ -658,13 +770,28 @@ namespace Genesis.RoomScan
                     AtlasHeight = unwrap.AtlasHeight
                 };
 
-                ApplyRefinedAtlas(result);
-                LastRefinedResult = result;
+                LastRefinedResult = original;
+                LastSimplifiedResult = null;
+
+                var toRender = original;
+                if (_textureRefinement.postBakeSimplificationRatio < 1f)
+                {
+                    var simplified = await _textureRefinement.SimplifyRefinedMeshAsync(original);
+                    LastSimplifiedResult = simplified;
+                    toRender = simplified;
+                }
+
+                ApplyRefinedAtlas(toRender);
                 HasRefinedTexture = true;
+                RefinedMeshReady?.Invoke(_refinedMesh, _refinedAtlasTexture);
                 SetRenderMode(ScanRenderMode.Refined);
 
                 if (_persistence != null && _persistence.HasActivePackage)
-                    await _persistence.SaveArtifactAsync(ArtifactType.Refined, null, result);
+                {
+                    await _persistence.SaveArtifactAsync(ArtifactType.Refined, null, original);
+                    if (LastSimplifiedResult.HasValue)
+                        await _persistence.SaveArtifactAsync(ArtifactType.SimplifiedMesh, null, LastSimplifiedResult);
+                }
 
                 Logger.Info("On-device texture refinement complete");
             }
@@ -940,16 +1067,29 @@ namespace Genesis.RoomScan
 
         private void ApplyRefinedAtlas(RefinedTextureResult result)
         {
+            if (_refinedAtlasTexture != null)
+                Destroy(_refinedAtlasTexture);
+
             _refinedAtlasTexture = new Texture2D(result.AtlasWidth, result.AtlasHeight,
                 TextureFormat.RGBA32, false) { filterMode = FilterMode.Bilinear };
             _refinedAtlasTexture.SetPixelData(result.AtlasPixels, 0);
             _refinedAtlasTexture.Apply();
 
-            Logger.Info($"Refined atlas applied: " +
+            if (_refinedMesh == null)
+                _refinedMesh = new Mesh { name = "RefinedScanMesh", indexFormat = IndexFormat.UInt32 };
+
+            _refinedMesh.Clear();
+            _refinedMesh.SetVertices(result.Positions);
+            _refinedMesh.SetNormals(result.Normals);
+            _refinedMesh.SetUVs(0, result.UVs);
+            _refinedMesh.SetTriangles(result.Indices, 0);
+
+            Logger.Info($"Refined mesh applied: " +
                 $"{result.Positions.Length} verts, {result.Indices.Length / 3} tris, " +
                 $"atlas {result.AtlasWidth}x{result.AtlasHeight}");
 
             EnsureRefinedRenderer();
+            _refinedMeshFilter.mesh = _refinedMesh;
             _refinedRenderer.material.mainTexture = _refinedAtlasTexture;
         }
 
@@ -964,7 +1104,9 @@ namespace Genesis.RoomScan
             _refinedMeshFilter.mesh = mesh;
             _refinedRenderer.material.mainTexture = atlas;
             HasRefinedTexture = true;
+            RefinedMeshReady?.Invoke(mesh, atlas);
         }
+
 
         internal void ApplyHQTexture(Texture2D atlas)
         {
@@ -1134,6 +1276,93 @@ namespace Genesis.RoomScan
             }
         }
 
+        // ─────────────────────────────────────────────────────────────
+        //  Coverage metrics & progress
+        // ─────────────────────────────────────────────────────────────
+
+        private ScanCoverage BuildCoverage()
+        {
+            int surfaceVoxels = _volumeIntegrator != null ? _volumeIntegrator.SurfaceVoxelCount : 0;
+            int frozenVoxels = _volumeIntegrator != null ? _volumeIntegrator.FrozenSurfaceCount : 0;
+            int coloredVoxels = _volumeIntegrator != null ? _volumeIntegrator.ColoredSurfaceCount : 0;
+            int vertCount = _meshExtractor != null ? _meshExtractor.LastVertexCount : 0;
+            int idxCount = _meshExtractor != null ? _meshExtractor.LastIndexCount : 0;
+
+            float colorCov = surfaceVoxels > 0 ? (float)coloredVoxels / surfaceVoxels : 0f;
+            float frozenFrac = surfaceVoxels > 0 ? (float)frozenVoxels / surfaceVoxels : 0f;
+
+            return new ScanCoverage
+            {
+                IntegrationCount = _volumeIntegrator != null ? _volumeIntegrator.IntegrationCount : 0,
+                MeshVertexCount = vertCount,
+                MeshTriangleCount = idxCount / 3,
+                SurfaceVoxelCount = surfaceVoxels,
+                FrozenSurfaceCount = frozenVoxels,
+                ColoredSurfaceCount = coloredVoxels,
+                ColorCoverage = colorCov,
+                FrozenFraction = frozenFrac,
+                KeyframeCount = _keyframeCollector != null ? _keyframeCollector.SavedCount : 0,
+                IsStabilized = _stableVertexCycles >= StableThresholdCycles
+            };
+        }
+
+        private ScanProgress BuildProgress()
+        {
+            var cov = BuildCoverage();
+            float geometryStability = cov.IsStabilized ? 1f : Mathf.Clamp01(_stableVertexCycles / (float)StableThresholdCycles);
+            float progress = cov.FrozenFraction * 0.5f + cov.ColorCoverage * 0.3f + geometryStability * 0.2f;
+
+            ScanPhase phase;
+            if (!IsScanning && _volumeIntegrator != null && _volumeIntegrator.IntegrationCount == 0)
+                phase = ScanPhase.NotStarted;
+            else if (_stableVertexCycles < 2)
+                phase = ScanPhase.Discovering;
+            else if (_stableColorCycles < StableThresholdCycles)
+                phase = ScanPhase.Refining;
+            else if (_stabilizedTime > 0f && Time.time - _stabilizedTime < StabilizedHoldSeconds)
+                phase = ScanPhase.Stabilized;
+            else
+                phase = ScanPhase.Complete;
+
+            return new ScanProgress
+            {
+                Coverage = cov,
+                OverallProgress = Mathf.Clamp01(progress),
+                Phase = phase
+            };
+        }
+
+        private void UpdatePlateauDetection()
+        {
+            int curVerts = _meshExtractor != null ? _meshExtractor.LastVertexCount : 0;
+            if (_prevVertexCount > 0 && curVerts > 0)
+            {
+                float growth = Mathf.Abs(curVerts - _prevVertexCount) / (float)_prevVertexCount;
+                if (growth < VertexGrowthThreshold)
+                    _stableVertexCycles++;
+                else
+                    _stableVertexCycles = 0;
+            }
+            _prevVertexCount = curVerts;
+
+            float curColor = _volumeIntegrator != null && _volumeIntegrator.SurfaceVoxelCount > 0
+                ? (float)_volumeIntegrator.ColoredSurfaceCount / _volumeIntegrator.SurfaceVoxelCount
+                : 0f;
+            if (_prevColorCoverage > 0f)
+            {
+                float colorGrowth = Mathf.Abs(curColor - _prevColorCoverage);
+                if (colorGrowth < ColorGrowthThreshold)
+                    _stableColorCycles++;
+                else
+                    _stableColorCycles = 0;
+            }
+            _prevColorCoverage = curColor;
+
+            if (_stableVertexCycles >= StableThresholdCycles && _stableColorCycles >= StableThresholdCycles
+                && _stabilizedTime == 0f)
+                _stabilizedTime = Time.time;
+        }
+
         private static readonly int NormalFallbackID = Shader.PropertyToID("_RSNormalFallback");
 
         private void SetSafeShaderDefaults()
@@ -1270,18 +1499,15 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
-        /// Keyframe directory. Uses active package's keyframes/ if loaded, else GSExport/.
+        /// Keyframe directory within the active package (tmp or saved).
+        /// Returns null if no package is active.
         /// </summary>
         public string KeyframeDirectory
         {
             get
             {
-                if (_persistence != null && _persistence.HasActivePackage)
-                {
-                    string pkgKf = Path.Combine(_persistence.ActivePackageDirectory, "keyframes");
-                    if (Directory.Exists(pkgKf)) return pkgKf;
-                }
-                return Path.Combine(Application.persistentDataPath, "GSExport");
+                if (_persistence == null || !_persistence.HasActivePackage) return null;
+                return Path.Combine(_persistence.ActivePackageDirectory, "keyframes");
             }
         }
 
@@ -1311,6 +1537,7 @@ namespace Genesis.RoomScan
                         _persistence.DeleteArtifactFromPackage(ArtifactType.Refined);
                         HasRefinedTexture = false;
                         LastRefinedResult = null;
+                        LastSimplifiedResult = null;
                         _cachedUnwrap = null;
                         _refinedMesh = null;
                         SetRenderMode(ScanRenderMode.Vertex);
@@ -1336,9 +1563,10 @@ namespace Genesis.RoomScan
             _persistence?.DeleteArtifactFromPackage(ArtifactType.EnhancedMesh);
             HasEnhancedMesh = false;
 
-            if (LastRefinedResult.HasValue)
+            var restore = LastSimplifiedResult ?? LastRefinedResult;
+            if (restore.HasValue)
             {
-                var r = LastRefinedResult.Value;
+                var r = restore.Value;
                 if (_refinedMesh != null)
                 {
                     _refinedMesh.Clear();
@@ -1351,7 +1579,8 @@ namespace Genesis.RoomScan
                 }
             }
 
-            Logger.Info("Enhanced mesh deleted, original restored");
+            Logger.Info("Enhanced mesh deleted, restored to " +
+                        (LastSimplifiedResult.HasValue ? "simplified" : "original refined"));
         }
 
         /// <summary>

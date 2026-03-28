@@ -28,6 +28,8 @@ Real-time 3D room reconstruction on Meta Quest 3. Produces a textured mesh from 
 - **Mesh Enhancement** — Server-side mesh smoothing via bilateral normal filter + optional RANSAC plane detection and vertex snapping. Enhanced mesh saved as a separate artifact preserving the original refined mesh.
 - **Render Mode Switching** — Cycle between Wireframe, Vertex, Triplanar, Refined, HQRefined, Splat, and None at runtime via debug menu or controller binding (default: A/X button). Unavailable modes are automatically skipped during cycling (e.g., Triplanar requires `TriplanarCache`, Splat requires trained data).
 - **Freeze Tint Toggle** — Independent toggle (not tied to render mode) shows/hides a blue tint overlay on frozen voxels in live mesh modes (Vertex, Triplanar, Wireframe). Bindable via `RoomScanInputHandler`.
+- **Game Integration APIs** — `LoadRefinedOnlyAsync()` for fast game-mode loading (skips TSDF/Surface Nets reconstruction, loads only the baked mesh + atlas). `ReleaseScanResources()` frees ~400-500 MB GPU memory after scanning. Public `RefinedMesh`/`RefinedAtlas` properties and `RefinedMeshReady` event for custom rendering. `ScanCoverage`/`ScanProgress` structs expose scan metrics for guided UX.
+- **Post-Bake Mesh Simplification** — UV-preserving mesh simplification via `meshopt_simplifyWithAttributes` runs after atlas baking (configurable ratio), preserving texture quality. Replaces the old broken pre-bake decimation.
 
 ## Requirements
 
@@ -85,7 +87,7 @@ For Gaussian Splat support, also add the optional dependency:
 1. Create a new blank URP scene
 2. Add a **Camera Rig** and **Passthrough** from Meta's Building Blocks (`Menu > Meta > Building Blocks`). The Camera Rig provides `OVRCameraRig` and the Passthrough block enables the passthrough layer — both are required before running the wizard.
 3. Open the setup wizard: **RoomScan > Setup Scene**
-4. The wizard checks prerequisites (AR Session, AROcclusionManager), configures project settings (boundaryless manifest, cleartext HTTP for LAN server), and adds all required core components plus VR input handlers and the debug menu. Optional modules (TriplanarCache, TextureRefinement, GSplat, etc.) are added via the inspector's **Add Module** dropdown on the RoomScanner component
+4. The wizard checks prerequisites (AR Session, AROcclusionManager), configures project settings (boundaryless manifest, cleartext HTTP for LAN server), and adds required core components. Use the **Game-Ready Preset** for lean game integration (PCA + TextureRefinement with 0.5 simplification ratio), and the **Debug Preset** for development tools (debug HUD, input handler, overlays, VR input infrastructure). Optional modules (TriplanarCache, GSplat, etc.) are added via the inspector's **Add Module** dropdown on the RoomScanner component
 5. Build and deploy to Quest 3
 6. The room mesh appears as you look around — surfaces solidify with repeated observations
 
@@ -98,8 +100,8 @@ Call `RoomScanner.Instance.StartScanning()` to begin (or use the debug menu). As
 1. **Depth integration**: Each depth frame is fused into the TSDF volume with color from the passthrough camera
 2. **Mesh extraction**: GPU Surface Nets extracts a mesh from the volume every few frames (after a minimum number of integrations)
 3. **Texturing**: Camera RGB is baked into triplanar world-space textures for persistent surface color (with vertex color fallback)
-4. **Keyframe capture**: Motion-gated JPEG snapshots + camera poses are saved to `GSExport/` on disk — these are used later for Gaussian Splat training
-5. **Point cloud export**: GPU mesh vertices are auto-exported as `points3d.ply` every 30 seconds (configurable)
+4. **Keyframe capture**: Motion-gated JPEG snapshots + camera poses are saved into the active scan package on disk — these are used later for Gaussian Splat training
+5. **Point cloud export**: GPU mesh vertices exported as `points3d.ply` on demand (before GS training or via debug menu)
 
 **Tips for a good scan**: Move slowly around the room. Look at surfaces from multiple angles — repeated observations from different viewpoints improve mesh quality. Make sure to cover walls, floor, ceiling, and furniture from several directions before training.
 
@@ -120,7 +122,7 @@ Once the room is well-scanned:
 2. Verify the **Server URL** points to your PC running [RoomScan-GaussianSplatServer](https://github.com/arghyasur1991/RoomScan-GaussianSplatServer). If you used the setup wizard and your PC is on the same LAN, the IP is auto-detected and should already be correct. For a cloud/remote server, edit the URL in the debug menu or set it in the Inspector before building.
 3. Press **Start GS Training** — this triggers the full pipeline automatically:
    - Exports the current mesh as a point cloud (`points3d.ply`)
-   - ZIPs all keyframes, poses, and point cloud from `GSExport/`
+   - ZIPs all keyframes, poses, and point cloud from the active package
    - Uploads the ZIP to the server
    - The debug menu shows live training status: state, progress bar, iteration count, elapsed time, backend
    - When training completes, the trained PLY is downloaded back to the Quest
@@ -179,20 +181,23 @@ RoomScans/
     scan.bin              # TSDF + color volumes (v1 binary)
     anchor.json           # Spatial anchor UUID + per-artifact matrices
     triplanar/            # Color + depth textures (saved when triplanar is enabled)
-    keyframes/            # Copied from GSExport/ (images + frames.jsonl)
+    keyframes/            # Motion-gated keyframes (images/ + frames.jsonl)
     splat.ply             # Auto-saved when GS training completes
     refined_mesh.bin      # Auto-saved when on-device refinement completes
     refined_atlas.raw     # Auto-saved with refined mesh
+    simplified_mesh.bin   # Auto-saved when post-bake simplification runs (ratio < 1)
     enhanced_mesh.bin     # Auto-saved when server mesh enhancement completes
     hq_atlas.png          # Auto-saved when server atlas enhancement completes
 ```
 
-- **Save Scan**: Creates a new package. Persists the TSDF + color volumes, triplanar textures (when enabled), copies keyframes, and creates a persisted `OVRSpatialAnchor` for cross-session relocation. Sets this package as the active target for subsequent artifact auto-saves.
+- **Save Scan**: Promotes the temporary scan package to a permanent package. Persists the TSDF + color volumes, triplanar textures (when enabled), and creates a persisted `OVRSpatialAnchor` for cross-session relocation. Keyframes are already in-place from scanning. Sets this package as the active target for subsequent artifact auto-saves. Saving is disabled while scanning is active.
 - **Load Scan**: Browse saved packages in the **Saved Scans** view. Loading a package localizes the spatial anchor, computes per-artifact relocation matrices, and restores all data including splat, refined textures, enhanced mesh, and HQ atlas.
 - **Auto-save artifacts**: When a splat download completes, on-device refinement finishes, atlas/mesh enhancement finishes, the artifact is automatically saved to the active package — no manual "Save Scan" needed.
 - **Delete artifact**: Context-sensitive deletion in the Scan view — deletes the artifact matching the current render mode (splat, refined, enhanced mesh, or HQ) from the active package.
 - **Delete package**: Full package deletion from the Saved Scans view, including erasing the spatial anchor from persistent storage.
-- **Clear All Data**: Stops scanning, clears volumes/mesh/keyframes from memory, clears the active package reference.
+- **Clear All Data**: Stops scanning, clears volumes/mesh/keyframes from memory, cleans up any temporary package, clears the active package reference.
+
+**Data flow**: When scanning starts, a temporary package (`_tmp`) is created. All keyframes and artifacts write directly into it. On save, `_tmp` is atomically promoted to a permanent package — no file copying needed. If the app crashes, `_tmp` is cleaned up on next startup.
 
 ### Architecture
 
@@ -216,9 +221,8 @@ RoomScanner (orchestrator, events, scan lifecycle)
   ├── TriplanarCache (bake camera RGB → 3 world-space textures + depth maps)
   ├── TextureRefinement (GPU readback → xatlas UV unwrap → multi-view atlas bake)
   │     └── requires KeyframeCollector (auto-added)
-  ├── PointCloudExporter (GPU mesh → points3d.ply via AsyncGPUReadback)
   └── [separate assembly] GSplatManager + GSplatServerClient (Gaussian Splat training & rendering)
-        └── requires KeyframeCollector + PointCloudExporter (auto-added)
+        └── requires KeyframeCollector (auto-added)
 ```
 
 All optional modules implement `IRoomScanModule` and are discovered automatically at startup. The `GaussianSplatting` package dependency lives in the separate `Genesis.RoomScan.GSplat` assembly — consumers who don't need Gaussian Splats can omit it entirely.
@@ -231,8 +235,8 @@ QuestRoomScan captures keyframes and a dense point cloud during scanning, upload
 
 ### On-Device Capture (automatic during scanning)
 
-- **KeyframeCollector**: Motion-gated JPEG frames + camera poses saved to `GSExport/` on disk (`images/*.jpg`, `frames.jsonl`). Captures are triggered by camera movement — you get more keyframes by looking at the room from different angles.
-- **PointCloudExporter**: GPU mesh vertices exported as binary PLY (`points3d.ply`) via `AsyncGPUReadback`. Auto-exports every 30 seconds during scanning, or manually via the debug menu.
+- **KeyframeCollector**: Motion-gated JPEG frames + camera poses saved directly into the active scan package (`keyframes/images/*.jpg`, `keyframes/frames.jsonl`). Captures are triggered by camera movement — you get more keyframes by looking at the room from different angles.
+- **PointCloudExporter**: GPU mesh vertices exported as binary PLY (`points3d.ply`) via `AsyncGPUReadback`. Exported on demand — automatically before GS training upload, or manually via the debug menu's Tools view.
 
 ### Server Training (via [RoomScan-GaussianSplatServer](https://github.com/arghyasur1991/RoomScan-GaussianSplatServer))
 
@@ -246,7 +250,7 @@ npm run dev                  # Dashboard at http://localhost:5173
 When you press **Start GS Training** in the debug menu, the following happens automatically:
 
 1. **Export**: Final point cloud exported from GPU mesh
-2. **ZIP & Upload**: Quest packages `GSExport/` contents (`frames.jsonl`, `points3d.ply`, `images/*.jpg`) into a ZIP and POSTs to `{serverUrl}/upload?iterations={N}`
+2. **ZIP & Upload**: Quest packages the active scan's keyframe directory (`frames.jsonl`, `points3d.ply`, `images/*.jpg`) into a ZIP and POSTs to `{serverUrl}/upload?iterations={N}`
 3. **Convert**: Server converts Unity poses + intrinsics to COLMAP binary format, computes scene normalization
 4. **Train**: Gaussian Splat training via msplat (Metal), gsplat (CUDA), or 3DGS — the debug menu shows live progress
 5. **Denormalize**: Output PLY is transformed back to world coordinates (reverses nerfstudio-style scene normalization)
@@ -296,7 +300,7 @@ Two-panel world-space UI Toolkit panel activated via **left thumbstick click**. 
 
 ### Views
 
-**Scan** (default) — Live status rows (Scanning, Mode, Integrations, Keyframes, Render, Package) and action buttons:
+**Scan** (default) — Live status rows (Scanning, Mode, Integrations, Keyframes, Render, Package) plus coverage metrics (Progress, Phase, Color Coverage, Frozen, Mesh Stats) and action buttons:
 - **Start/Stop Scanning**: Toggle depth integration
 - **Render Mode**: Cycle through Wireframe → Vertex → Triplanar → Refined → HQRefined → Splat → None (unavailable modes skipped)
 - **Freeze Tint**: Toggle blue tint overlay on frozen voxels (works in Vertex, Triplanar, and Wireframe modes)
@@ -305,7 +309,7 @@ Two-panel world-space UI Toolkit panel activated via **left thumbstick click**. 
 
 **Saved Scans** — Scrollable list of saved packages sorted newest-first. Each entry shows display name, date, artifact badges (KF, Tri, Splat, Refined, HQ, Enh), and Load/Delete buttons. Badge count shown on the nav button.
 
-**Refine** — On-device and server refinement status + action buttons. Tab is disabled when `TextureRefinement` module is not attached.
+**Refine** — On-device and server refinement status, mesh stats (original refined and simplified vertex/tri counts), and action buttons. Tab is disabled when `TextureRefinement` module is not attached.
 - **Refine Textures**: On-device GPU atlas bake from keyframes (multi-view blend + sharpen)
 - **HQ Refine (Server)**: Upload atlas for server-side super-resolution + inpainting
 - **Enhance Mesh (Server)**: Upload mesh for server-side bilateral smooth + plane snap
@@ -378,6 +382,113 @@ QuestRoomScan exists for a different reason: it's **open source, fully on-device
 
 QuestRoomScan is best suited for developers who need to integrate room scanning into their own applications, want full control over the reconstruction pipeline, or need to work with the raw scan data directly.
 
+## Game Integration Guide
+
+This section covers how to embed QuestRoomScan into a game that needs a one-time room scan followed by lightweight rendering.
+
+### Lifecycle: Scan Phase → Game Phase
+
+```
+1. Scan Phase:    StartScanning() → user looks around → StopScanning()
+2. Refine:        StartTextureRefinement() → wait for RefinedMeshReady event
+3. Transition:    ReleaseScanResources() → frees ~400-500 MB GPU memory
+4. Game Phase:    Render with standard MeshRenderer (1 draw call, baked texture)
+```
+
+On subsequent launches, skip scanning entirely:
+
+```
+1. LoadRefinedOnlyAsync(pkgId) → loads refined mesh + atlas in < 1 second
+2. Game Phase immediately
+```
+
+### Recommended Configuration
+
+For game integration where you want to minimize GPU overhead during scanning:
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| TriplanarCache | **Disabled** | Saves ~240 MB GPU; vertex colors are sufficient for scan-phase visualization |
+| VolumeIntegrator.voxelCount | 160³ or 192³ | Lower than default 256³ to reduce memory and integration cost |
+| TextureRefinement.postBakeSimplificationRatio | 0.3–0.5 | Reduce triangle count for game-phase rendering |
+| GaussianSplatRenderer | **Not attached** | Remove unless splat rendering is needed |
+
+### API Reference
+
+#### Accessing the Refined Mesh
+
+```csharp
+var scanner = RoomScanner.Instance;
+
+// Option 1: Subscribe to the event
+scanner.RefinedMeshReady += (mesh, atlas) =>
+{
+    // mesh: Unity Mesh with UV coordinates
+    // atlas: Texture2D with baked texture atlas
+    myMeshFilter.mesh = mesh;
+    myRenderer.material.mainTexture = atlas;
+};
+
+// Option 2: Read properties directly (null until refinement completes)
+Mesh mesh = scanner.RefinedMesh;
+Texture2D atlas = scanner.RefinedAtlas;
+Texture2D hqAtlas = scanner.HQAtlas; // null if no server enhancement
+```
+
+#### Lightweight Loading (Game Sessions)
+
+```csharp
+// Save the package ID after scanning
+string pkgId = scanner.Persistence.ActivePackageId;
+
+// On next launch — loads only refined mesh + atlas, no TSDF/Surface Nets
+bool ok = await RoomScanner.Instance.LoadRefinedOnlyAsync(pkgId);
+// Mesh is now visible with standard MeshRenderer, render mode auto-set to Refined
+```
+
+#### Releasing GPU Resources
+
+```csharp
+// After scanning + refinement, before entering gameplay
+scanner.ReleaseScanResources();
+// Frees ~400-500 MB (TSDF volumes, Surface Nets buffers, depth textures)
+// Refined MeshRenderer stays alive for game-phase rendering
+// Vertex/Wireframe/Triplanar modes become unavailable (IsModeAvailable returns false)
+
+// To scan again later (re-allocates everything):
+scanner.StartScanning();
+```
+
+#### Monitoring Scan Progress
+
+```csharp
+// Raw coverage metrics
+ScanCoverage cov = scanner.CurrentCoverage;
+Debug.Log($"Surfaces: {cov.SurfaceVoxelCount}, " +
+          $"Colored: {cov.ColorCoverage:P0}, " +
+          $"Frozen: {cov.FrozenFraction:P0}, " +
+          $"Stable: {cov.IsStabilized}");
+
+// High-level progress
+ScanProgress prog = scanner.CurrentProgress;
+progressBar.value = prog.OverallProgress; // 0.0 – 1.0
+statusText.text = prog.Phase.ToString();  // Discovering → Refining → Stabilized → Complete
+```
+
+#### Post-Bake Mesh Simplification
+
+Set `TextureRefinement.postBakeSimplificationRatio` in the Inspector (e.g. 0.5 for 50% triangle reduction). Simplification runs automatically after atlas baking, preserving UV coordinates via `meshopt_simplifyWithAttributes` with locked border vertices to prevent seam tearing.
+
+### Minimal Integration Checklist
+
+1. Add QuestRoomScan package to your project
+2. Run **RoomScan > Setup Scene** wizard (recommended with Game-Ready Preset)
+3. Disable `TriplanarCache` in inspector (save GPU memory) (Doesn't apply if Game-Ready preset used for setup)
+4. Set `postBakeSimplificationRatio` to 0.3–0.5 on `TextureRefinement` (Game-Ready Preset auto sets it to 0.5)
+5. Subscribe to `RefinedMeshReady` event
+6. After refinement: call `ReleaseScanResources()`, enter gameplay
+7. On subsequent launches: use `LoadRefinedOnlyAsync(pkgId)` to skip scanning
+
 ## Credits & Prior Art
 
 The TSDF volume integration and Surface Nets meshing approach draws inspiration from [anaglyphs/lasertag](https://github.com/anaglyphs/lasertag) by Julian Triveri & Hazel Roeder (MIT), which demonstrated real-time room reconstruction on Quest 3 inside a mixed reality game.
@@ -385,7 +496,7 @@ The TSDF volume integration and Surface Nets meshing approach draws inspiration 
 The texture refinement pipeline uses two open-source native C++ libraries:
 
 - **[xatlas](https://github.com/jpcy/xatlas)** by Jonathan Young (MIT) — automatic UV atlas generation with seam-aware chart parameterization and efficient packing. Used for UV unwrapping the GPU Surface Nets mesh prior to atlas baking.
-- **[meshoptimizer](https://github.com/zeux/meshoptimizer)** v1.0 by Arseny Kapoulkine (MIT) — mesh optimization toolkit. The `meshopt_simplify` function is available for optional mesh decimation before UV unwrapping. **Note:** Mesh decimation is currently disabled by default — it degrades atlas baking quality and performance. The decimation ratio defaults to 1.0 (no simplification).
+- **[meshoptimizer](https://github.com/zeux/meshoptimizer)** v1.0 by Arseny Kapoulkine (MIT) — mesh optimization toolkit. `meshopt_simplifyWithAttributes` is used for optional post-bake mesh simplification that preserves UV coordinates, with `LockBorder` to prevent seam tearing. Set `TextureRefinement.postBakeSimplificationRatio` < 1.0 to enable.
 
 Both libraries are compiled into a single native shared library (`libxatlas.so` / `libxatlas.bundle`) and invoked via P/Invoke from C#.
 

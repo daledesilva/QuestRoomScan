@@ -51,11 +51,14 @@ namespace Genesis.RoomScan
             IntPtr atlas, int meshIndex,
             int[] chartIndices, int maxVerts);
 
-        [DllImport(LIB)] private static extern int meshopt_simplify_mesh(
-            float[] positions, int vertexCount, int positionStride,
+        [DllImport(LIB)] private static extern int meshopt_simplify_with_attrs(
+            uint[] destination,
             uint[] indices, int indexCount,
+            float[] vertexPositions, int vertexCount, int vertexPositionsStride,
+            float[] vertexAttributes, int vertexAttributesStride,
+            float[] attributeWeights, int attributeCount,
             int targetIndexCount, float targetError,
-            uint[] outIndices, out float outError);
+            uint options, out float resultError);
 
         public struct UnwrapOptions
         {
@@ -216,50 +219,102 @@ namespace Genesis.RoomScan
             };
         }
 
-        public struct SimplifyResult
-        {
-            public uint[] Indices;
-            public int IndexCount;
-            public float ResultError;
-        }
+        private const uint MeshoptSimplifyLockBorder = 1;
 
         /// <summary>
-        /// Simplifies a mesh using meshoptimizer. Returns simplified index buffer.
-        /// Vertex positions are not modified — only triangles are removed/merged.
-        /// targetRatio is 0..1 (e.g. 0.5 = reduce to 50% of triangles).
+        /// Post-bake mesh simplification using meshopt_simplifyWithAttributes (UV-preserving).
+        /// UVs are passed as vertex attributes with LockBorder to prevent seam tears.
+        /// Returns a new <see cref="RefinedTextureResult"/> with compacted vertex/index arrays
+        /// (atlas pixels are NOT copied — caller must set them).
+        /// Throws if the native export is missing; caller should catch and skip simplification.
         /// </summary>
-        public static SimplifyResult Simplify(float[] positions, int vertexCount,
-            int[] indices, int indexCount, float targetRatio, float targetError = 1e-2f)
+        public static RefinedTextureResult SimplifyWithUVs(
+            Vector3[] positions, Vector3[] normals, Vector2[] uvs,
+            int[] indices, float targetRatio, float targetError = 1e-2f)
         {
+            int vertexCount = positions.Length;
+            int indexCount = indices.Length;
             int targetIndexCount = Mathf.Max(3, Mathf.RoundToInt(indexCount * Mathf.Clamp01(targetRatio)));
-            // Round down to multiple of 3
             targetIndexCount = (targetIndexCount / 3) * 3;
+
+            float[] flatPos = new float[vertexCount * 3];
+            for (int i = 0; i < vertexCount; i++)
+            {
+                flatPos[i * 3]     = positions[i].x;
+                flatPos[i * 3 + 1] = positions[i].y;
+                flatPos[i * 3 + 2] = positions[i].z;
+            }
 
             uint[] uIndices = new uint[indexCount];
             for (int i = 0; i < indexCount; i++)
                 uIndices[i] = (uint)indices[i];
 
             uint[] outIndices = new uint[indexCount];
-            int resultCount = meshopt_simplify_mesh(
-                positions, vertexCount, 12,
+            int resultCount;
+
+            float[] flatAttrs = new float[vertexCount * 2];
+            for (int i = 0; i < vertexCount; i++)
+            {
+                flatAttrs[i * 2]     = uvs[i].x;
+                flatAttrs[i * 2 + 1] = uvs[i].y;
+            }
+            float[] attrWeights = { 1f, 1f };
+
+            resultCount = meshopt_simplify_with_attrs(
+                outIndices,
                 uIndices, indexCount,
+                flatPos, vertexCount, 12,
+                flatAttrs, 8,
+                attrWeights, 2,
                 targetIndexCount, targetError,
-                outIndices, out float resultError);
+                MeshoptSimplifyLockBorder, out _);
 
             if (resultCount <= 0)
             {
                 Logger.Warning("[MeshOpt] Simplification produced 0 indices, using original mesh");
-                return new SimplifyResult { Indices = uIndices, IndexCount = indexCount, ResultError = 0f };
+                return new RefinedTextureResult
+                {
+                    Positions = positions,
+                    Normals = normals,
+                    UVs = uvs,
+                    Indices = indices
+                };
             }
 
-            uint[] trimmed = new uint[resultCount];
-            Array.Copy(outIndices, trimmed, resultCount);
+            bool[] used = new bool[vertexCount];
+            for (int i = 0; i < resultCount; i++)
+                used[outIndices[i]] = true;
 
-            return new SimplifyResult
+            int[] remap = new int[vertexCount];
+            int newCount = 0;
+            for (int i = 0; i < vertexCount; i++)
+                remap[i] = used[i] ? newCount++ : -1;
+
+            var outPos = new Vector3[newCount];
+            var outNorm = new Vector3[newCount];
+            var outUVs = new Vector2[newCount];
+            for (int i = 0; i < vertexCount; i++)
             {
-                Indices = trimmed,
-                IndexCount = resultCount,
-                ResultError = resultError
+                if (!used[i]) continue;
+                int j = remap[i];
+                outPos[j]  = positions[i];
+                outNorm[j] = normals[i];
+                outUVs[j]  = uvs[i];
+            }
+
+            int[] outIdx = new int[resultCount];
+            for (int i = 0; i < resultCount; i++)
+                outIdx[i] = remap[outIndices[i]];
+
+            Logger.Info($"[MeshOpt] Simplified {indexCount / 3} -> {resultCount / 3} tris " +
+                        $"({vertexCount} -> {newCount} verts)");
+
+            return new RefinedTextureResult
+            {
+                Positions = outPos,
+                Normals = outNorm,
+                UVs = outUVs,
+                Indices = outIdx
             };
         }
     }

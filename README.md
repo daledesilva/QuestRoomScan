@@ -12,6 +12,8 @@ Real-time 3D room reconstruction on Meta Quest 3. Produces a textured mesh from 
 
 **[Full demo video](https://www.youtube.com/watch?v=lEn3GkH7Yao)** — recorded before multi-view blending, GPU sharpening, and atlas enhancement were added; current output quality is noticeably better.
 
+**If you're integrating this package into a game or app**, start with [Installation](#installation), [Quick Start](#quick-start), and [Game Integration Guide](#game-integration-guide). For the full scan pipeline and debug tooling, see [Usage Flow](#usage-flow) and [VR Debug Menu](#vr-debug-menu).
+
 ## Table of Contents
 
 - [Features](#features)
@@ -31,7 +33,7 @@ Real-time 3D room reconstruction on Meta Quest 3. Produces a textured mesh from 
 - [VR Debug Menu](#vr-debug-menu)
 - [Memory Budget (Quest 3)](#memory-budget-quest-3)
 - [Comparison with Hyperscape](#comparison-with-hyperscape)
-- [Game Integration Guide](#game-integration-guide)
+- [**Game Integration Guide**](#game-integration-guide)
 - [Credits & Prior Art](#credits--prior-art)
 - [License](#license)
 

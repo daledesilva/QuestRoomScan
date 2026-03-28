@@ -12,6 +12,29 @@ Real-time 3D room reconstruction on Meta Quest 3. Produces a textured mesh from 
 
 **[Full demo video](https://www.youtube.com/watch?v=lEn3GkH7Yao)** — recorded before multi-view blending, GPU sharpening, and atlas enhancement were added; current output quality is noticeably better.
 
+## Table of Contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Usage Flow](#usage-flow)
+  - [Scanning](#scanning)
+  - [Freeze / Unfreeze](#freeze--unfreeze)
+  - [Training Gaussian Splats](#training-gaussian-splats)
+  - [Texture Refinement](#texture-refinement)
+  - [Atlas Enhancement (HQ Refine)](#atlas-enhancement-hq-refine)
+  - [Mesh Enhancement](#mesh-enhancement)
+  - [Saving and Loading](#saving-and-loading)
+  - [Architecture](#architecture)
+- [Gaussian Splat Pipeline](#gaussian-splat-pipeline)
+- [VR Debug Menu](#vr-debug-menu)
+- [Memory Budget (Quest 3)](#memory-budget-quest-3)
+- [Comparison with Hyperscape](#comparison-with-hyperscape)
+- [Game Integration Guide](#game-integration-guide)
+- [Credits & Prior Art](#credits--prior-art)
+- [License](#license)
+
 ## Features
 
 - **GPU TSDF Integration** — Depth frames fused into a signed distance field via compute shaders

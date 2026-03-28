@@ -11,6 +11,11 @@ using UnityEngine.Android;
 
 namespace Genesis.RoomScan
 {
+    /// <summary>
+    /// Captures stereo depth from the AR occlusion subsystem, computes world-space normals,
+    /// runs optional bilateral filtering guided by the passthrough RGB feed, and produces
+    /// dilated depth textures consumed by <see cref="VolumeIntegrator"/> for TSDF integration.
+    /// </summary>
     [DefaultExecutionOrder(-40)]
     public class DepthCapture : MonoBehaviour
     {
@@ -39,10 +44,15 @@ namespace Genesis.RoomScan
         private readonly Matrix4x4[] _viewInv = new Matrix4x4[2];
         private Vector2 _planes;
 
+        /// <summary>Per-eye projection matrices derived from the depth frame's FOV and near/far planes.</summary>
         public Matrix4x4[] Proj => _proj;
+        /// <summary>Inverse projection matrices (per-eye).</summary>
         public Matrix4x4[] ProjInv => _projInv;
+        /// <summary>Per-eye view matrices (tracking-space to depth-camera-space).</summary>
         public Matrix4x4[] View => _view;
+        /// <summary>Inverse view matrices (per-eye), mapping depth-camera-space back to tracking-space.</summary>
         public Matrix4x4[] ViewInv => _viewInv;
+        /// <summary>Near and far clip distances (x = near, y = far) for the current depth frame.</summary>
         public Vector2 Planes => _planes;
 
         // Shader property IDs
@@ -75,6 +85,7 @@ namespace Genesis.RoomScan
         private static readonly int BilSigmaDepthID = Shader.PropertyToID("_SigmaDepth");
         private static readonly int BilFilterRadiusID = Shader.PropertyToID("_FilterRadius");
 
+        /// <summary>True once a valid depth frame has been received from the AR occlusion subsystem.</summary>
         public static bool DepthAvailable { get; private set; }
 
         private ComputeKernelHelper _normKernel;
@@ -85,13 +96,16 @@ namespace Genesis.RoomScan
         private bool _hasBilateralKernel;
 
         private Texture _depthTex;
+        /// <summary>The current depth texture (raw or bilateral-filtered), as a stereo Tex2DArray.</summary>
         public Texture DepthTex => _depthTex;
 
         private RenderTexture _normTex;
+        /// <summary>World-space normals computed from the depth texture via the DepthNorm compute shader.</summary>
         public RenderTexture NormTex => _normTex;
 
         private RenderTexture _dilationA, _dilationB;
         private RenderTexture _dilatedDepth;
+        /// <summary>Depth texture after jump-flood dilation, used by the integrator to fill holes near voxel boundaries.</summary>
         public RenderTexture DilatedDepthTex => _dilatedDepth;
 
         private RenderTexture _simulatedDepthTex;
@@ -111,6 +125,7 @@ namespace Genesis.RoomScan
 
         private const string ScenePermission = "com.oculus.permission.USE_SCENE";
 
+        /// <summary>Raised after each depth frame is processed (filtering, normals computed, globals set).</summary>
         public event Action Updated;
 
         /// <summary>
@@ -182,7 +197,7 @@ namespace Genesis.RoomScan
             if (ovrRig != null && ovrRig.trackingSpace != null)
             {
                 _trackingSpaceTransform = ovrRig.trackingSpace;
-                Debug.Log($"[RoomScan] DepthCapture: using OVRCameraRig.trackingSpace '{_trackingSpaceTransform.name}'");
+                Logger.Info($"DepthCapture: using OVRCameraRig.trackingSpace '{_trackingSpaceTransform.name}'");
                 return;
             }
 
@@ -190,13 +205,13 @@ namespace Genesis.RoomScan
             if (_xrOrigin != null && _xrOrigin.CameraFloorOffsetObject != null)
             {
                 _trackingSpaceTransform = _xrOrigin.CameraFloorOffsetObject.transform;
-                Debug.Log($"[RoomScan] DepthCapture: using XROrigin.CameraFloorOffsetObject '{_trackingSpaceTransform.name}'");
+                Logger.Info($"DepthCapture: using XROrigin.CameraFloorOffsetObject '{_trackingSpaceTransform.name}'");
                 return;
             }
 
             // Last resort: XROrigin root (pre-fix behaviour)
             _trackingSpaceTransform = _xrOrigin != null ? _xrOrigin.transform : null;
-            Debug.LogWarning("[RoomScan] DepthCapture: no TrackingSpace found, falling back to XROrigin root");
+            Logger.Warning("DepthCapture: no TrackingSpace found, falling back to XROrigin root");
         }
 
         private void EnsureARSession()
@@ -205,7 +220,7 @@ namespace Genesis.RoomScan
             {
                 var go = new GameObject("[AR Session]");
                 go.AddComponent<ARSession>();
-                Debug.Log("[RoomScan] Created ARSession (was missing from scene)");
+                Logger.Info("Created ARSession (was missing from scene)");
             }
         }
 
@@ -218,10 +233,10 @@ namespace Genesis.RoomScan
             }
             else
             {
-                Debug.Log("[RoomScan] Requesting USE_SCENE permission...");
+                Logger.Info("Requesting USE_SCENE permission...");
                 var callbacks = new PermissionCallbacks();
                 callbacks.PermissionGranted += _ => EnableOcclusion();
-                callbacks.PermissionDenied += _ => Debug.LogError("[RoomScan] USE_SCENE permission denied — depth will not work");
+                callbacks.PermissionDenied += _ => Logger.Error("USE_SCENE permission denied — depth will not work");
                 Permission.RequestUserPermission(ScenePermission, callbacks);
             }
 #else
@@ -235,7 +250,7 @@ namespace Genesis.RoomScan
         {
             if (_arOcclusionManager == null) return;
 
-            Debug.Log("[RoomScan] Enabling AROcclusionManager...");
+            Logger.Info("Enabling AROcclusionManager...");
 
             // Unsubscribe first to avoid double subscription
             _arOcclusionManager.frameReceived -= OnDepthFrame;
@@ -256,7 +271,7 @@ namespace Genesis.RoomScan
 
             if (_arOcclusionManager == null) return;
             var sub = _arOcclusionManager.subsystem;
-            Debug.Log($"[RoomScan] Occlusion subsystem: {(sub != null ? sub.GetType().Name : "null")}, running={sub?.running}");
+            Logger.Info($"Occlusion subsystem: {(sub != null ? sub.GetType().Name : "null")}, running={sub?.running}");
         }
 
         private void OnApplicationPause(bool paused)
@@ -303,7 +318,7 @@ namespace Genesis.RoomScan
             {
                 _lastLogTime = t;
                 var sub = _arOcclusionManager != null ? _arOcclusionManager.subsystem : null;
-                Debug.Log($"[RoomScan] DepthCapture: frames={_frameCount}, depthAvail={DepthAvailable}, " +
+                Logger.Info($"DepthCapture: frames={_frameCount}, depthAvail={DepthAvailable}, " +
                           $"occMgr.enabled={_arOcclusionManager?.enabled}, sub={sub?.GetType().Name ?? "null"}, " +
                           $"running={sub?.running}");
             }
@@ -313,7 +328,7 @@ namespace Genesis.RoomScan
         {
             _frameCount++;
             if (_frameCount <= 3 || _frameCount % 100 == 0)
-                Debug.Log($"[RoomScan] OnDepthFrame #{_frameCount}, textures={args.externalTextures.Count}");
+                Logger.Info($"OnDepthFrame #{_frameCount}, textures={args.externalTextures.Count}");
 
             if (Application.isEditor)
                 HandleEditorSimulation(args);
@@ -420,10 +435,19 @@ namespace Genesis.RoomScan
             _planes = new Vector2(depthPlanes.nearZ, depthPlanes.farZ);
         }
 
+        private bool _loggedBilateralSkip;
         private void ApplyBilateralFilter()
         {
             if (!enableBilateralFilter || !_hasBilateralKernel || _rgbGuide == null || _depthTex == null)
+            {
+                if (!_loggedBilateralSkip && enableBilateralFilter && _hasBilateralKernel && _rgbGuide == null)
+                {
+                    _loggedBilateralSkip = true;
+                    Logger.Info("Bilateral depth filter skipped — no RGB guide (camera unavailable). " +
+                              "Depth will be noisier at edges.");
+                }
                 return;
+            }
 
             int w = _depthTex.width;
             int h = _depthTex.height;

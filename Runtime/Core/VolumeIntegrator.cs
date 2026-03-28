@@ -7,6 +7,11 @@ using UnityEngine.Rendering;
 
 namespace Genesis.RoomScan
 {
+    /// <summary>
+    /// Manages the GPU TSDF + color volume and dispatches compute-shader integration, pruning,
+    /// and freeze/unfreeze passes. Voxels are integrated from depth and optional camera color
+    /// each frame, with configurable convergence, exclusion zones, and warmup clearing.
+    /// </summary>
     public class VolumeIntegrator : MonoBehaviour
     {
         public static VolumeIntegrator Instance { get; private set; }
@@ -46,7 +51,10 @@ namespace Genesis.RoomScan
 
         private RenderTexture _volume;
         private RenderTexture _colorVolume;
+
+        /// <summary>3D RenderTexture (R8G8_SNorm) storing the truncated signed distance field.</summary>
         public RenderTexture Volume => _volume;
+        /// <summary>3D RenderTexture (RGBA8_UNorm) storing per-voxel accumulated color.</summary>
         public RenderTexture ColorVolume => _colorVolume;
         public int3 VoxelCount => voxelCount;
         public float VoxelSize => voxelSize;
@@ -98,13 +106,19 @@ namespace Genesis.RoomScan
         private bool _frustumReady;
         private float _lastPruneTime;
 
+        /// <summary>
+        /// Transforms whose positions define spherical exclusion zones; voxels near these are skipped during integration.
+        /// </summary>
         public readonly List<Transform> ExclusionZones = new();
         private readonly Vector4[] _exclusionPositions = new Vector4[64];
 
+        /// <summary>Total number of integration passes dispatched since startup or the last clear.</summary>
         public int IntegrationCount { get; private set; }
         public int WarmupIntegrations => warmupIntegrations;
 
+        /// <summary>Raised after each integration compute dispatch (before pruning).</summary>
         public event Action Integrated;
+        /// <summary>Raised after the volume is cleared.</summary>
         public event Action Cleared;
 
         private Texture _pendingCamFrame;
@@ -115,6 +129,7 @@ namespace Genesis.RoomScan
         private Vector2 _pendingSensorRes;
         private Vector2 _pendingCurrentRes;
         private RenderTexture _camFrameCopy;
+        private Texture2D _dummyCamTex;
 
         private void Awake()
         {
@@ -144,6 +159,10 @@ namespace Genesis.RoomScan
             _unfreezeKernel = new ComputeKernelHelper(compute, "UnfreezeInFrustum");
             _unfreezeKernel.Set(VolumeRWID, _volume);
 
+            _dummyCamTex = new Texture2D(1, 1, TextureFormat.RGBA32, false);
+            _dummyCamTex.SetPixel(0, 0, Color.black);
+            _dummyCamTex.Apply(false, true);
+
             SetShaderConstants();
             Clear();
 
@@ -157,14 +176,15 @@ namespace Genesis.RoomScan
             if (_volume) Destroy(_volume);
             if (_colorVolume) Destroy(_colorVolume);
             if (_camFrameCopy) Destroy(_camFrameCopy);
+            if (_dummyCamTex) Destroy(_dummyCamTex);
         }
 
         private void CreateVolume()
         {
             long tsdfBytes = (long)voxelCount.x * voxelCount.y * voxelCount.z * 2;
             long colorBytes = (long)voxelCount.x * voxelCount.y * voxelCount.z * 4;
-            Debug.Log($"[RoomScan] TSDF volume: {voxelCount} RG8_SNorm = {tsdfBytes / (1024 * 1024)}MB");
-            Debug.Log($"[RoomScan] Color volume: {voxelCount} RGBA8_UNorm = {colorBytes / (1024 * 1024)}MB");
+            Logger.Info($"TSDF volume: {voxelCount} RG8_SNorm = {tsdfBytes / (1024 * 1024)}MB");
+            Logger.Info($"Color volume: {voxelCount} RGBA8_UNorm = {colorBytes / (1024 * 1024)}MB");
 
             _volume = new RenderTexture(voxelCount.x, voxelCount.y, 0, GraphicsFormat.R8G8_SNorm, 0)
             {
@@ -211,6 +231,9 @@ namespace Genesis.RoomScan
             Shader.SetGlobalTexture(ColorVolumeID, _colorVolume);
         }
 
+        /// <summary>
+        /// Zeros the TSDF and color volumes on the GPU.
+        /// </summary>
         public void Clear()
         {
             _clearKernel.Set(VolumeRWID, _volume);
@@ -280,7 +303,7 @@ namespace Genesis.RoomScan
             // Rebind per-kernel UAV references so subsequent integrations/clears use new textures
             RebindVolumeTextures();
 
-            Debug.Log($"[RoomScan] BakeRelocation complete — resampled {vc} voxels, " +
+            Logger.Info($"BakeRelocation complete — resampled {vc} voxels, " +
                       $"reloc row0={relocationMatrix.GetRow(0)}, inv row0={invRelocation.GetRow(0)}");
         }
 
@@ -309,7 +332,7 @@ namespace Genesis.RoomScan
                 focalLen, principalPt, sensorRes, currentRes);
             _freezeKernel.Set(VolumeRWID, _volume);
             _freezeKernel.DispatchFit(_volume);
-            Debug.Log("[RoomScan] FreezeInView dispatched");
+            Logger.Info("FreezeInView dispatched");
         }
 
         /// <summary>
@@ -322,7 +345,7 @@ namespace Genesis.RoomScan
                 focalLen, principalPt, sensorRes, currentRes);
             _unfreezeKernel.Set(VolumeRWID, _volume);
             _unfreezeKernel.DispatchFit(_volume);
-            Debug.Log("[RoomScan] UnfreezeInView dispatched");
+            Logger.Info("UnfreezeInView dispatched");
         }
 
         private void SetFrustumCameraUniforms(ComputeKernelHelper kernel, Vector3 camPos,
@@ -377,6 +400,10 @@ namespace Genesis.RoomScan
             Graphics.Blit(_pendingCamFrame, _camFrameCopy);
         }
 
+        /// <summary>
+        /// Builds the frustum sample positions buffer used by the Integrate kernel.
+        /// Called lazily on first integration or after a volume clear/load.
+        /// </summary>
         public void SetupFrustumVolume()
         {
             if (!DepthCapture.DepthAvailable) return;
@@ -421,7 +448,7 @@ namespace Genesis.RoomScan
 
             if (positions.Count == 0) return;
 
-            Debug.Log($"[RoomScan] Frustum volume: {positions.Count} positions ({positions.Count * 12 / 1024}KB)");
+            Logger.Info($"Frustum volume: {positions.Count} positions ({positions.Count * 12 / 1024}KB)");
 
             _frustumVolume?.Release();
             _frustumVolume = new ComputeBuffer(positions.Count, sizeof(float) * 3);
@@ -430,10 +457,14 @@ namespace Genesis.RoomScan
             _frustumReady = true;
         }
 
+        /// <summary>
+        /// Dispatches one TSDF + color integration pass from the current depth frame.
+        /// Handles frustum setup, exclusion zones, warmup clearing, and periodic pruning.
+        /// </summary>
         public void Integrate()
         {
             var dc = DepthCapture.Instance;
-            if (dc == null || !DepthCapture.DepthAvailable) return;
+            if (dc == null || !DepthCapture.DepthAvailable || dc.DepthTex == null) return;
             if (!_frustumReady) SetupFrustumVolume();
             if (!_frustumReady) return;
 
@@ -473,6 +504,7 @@ namespace Genesis.RoomScan
             }
             else
             {
+                compute.SetTexture(_integrateKernel.KernelIndex, CamRGBID, _dummyCamTex);
                 compute.SetInt(CamAvailableID, 0);
             }
 
@@ -487,7 +519,7 @@ namespace Genesis.RoomScan
 
             if (warmupIntegrations > 0 && IntegrationCount == warmupIntegrations)
             {
-                Debug.Log($"[RoomScan] Warmup complete ({warmupIntegrations} frames), clearing volume to discard sensor startup noise");
+                Logger.Info($"Warmup complete ({warmupIntegrations} frames), clearing volume to discard sensor startup noise");
                 Clear();
             }
 
@@ -512,7 +544,7 @@ namespace Genesis.RoomScan
         {
             if (_volume == null || _colorVolume == null)
             {
-                Debug.LogError("[RoomScan] Cannot load volumes: textures not created");
+                Logger.Error("Cannot load volumes: textures not created");
                 return false;
             }
 
@@ -522,12 +554,12 @@ namespace Genesis.RoomScan
 
             if (tsdfBytes.Length != expectedTsdf)
             {
-                Debug.LogError($"[RoomScan] TSDF size mismatch: got {tsdfBytes.Length}, expected {expectedTsdf}");
+                Logger.Error($"TSDF size mismatch: got {tsdfBytes.Length}, expected {expectedTsdf}");
                 return false;
             }
             if (colorBytes.Length != expectedColor)
             {
-                Debug.LogError($"[RoomScan] Color volume size mismatch: got {colorBytes.Length}, expected {expectedColor}");
+                Logger.Error($"Color volume size mismatch: got {colorBytes.Length}, expected {expectedColor}");
                 return false;
             }
 
@@ -549,7 +581,7 @@ namespace Genesis.RoomScan
             IntegrationCount = integrationCount;
             _frustumReady = false;
 
-            Debug.Log($"[RoomScan] Volumes loaded: {s}, integrationCount={integrationCount}");
+            Logger.Info($"Volumes loaded: {s}, integrationCount={integrationCount}");
             return true;
         }
     }

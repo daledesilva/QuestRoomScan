@@ -7,7 +7,7 @@ namespace Genesis.RoomScan
     /// Renders the GPU Surface Nets mesh via Graphics.RenderPrimitivesIndirect.
     /// Replaces per-chunk MeshFilter+MeshRenderer with a single indirect draw call.
     /// </summary>
-    public class GPUMeshRenderer : MonoBehaviour
+    internal class GPUMeshRenderer : MonoBehaviour
     {
         [SerializeField] private Material gpuMeshMaterial;
 
@@ -36,7 +36,7 @@ namespace Genesis.RoomScan
             set => gpuMeshMaterial = value;
         }
 
-        public void Initialize(GPUSurfaceNets surfaceNets, Bounds volumeBounds)
+        internal void Initialize(GPUSurfaceNets surfaceNets, Bounds volumeBounds)
         {
             _surfaceNets = surfaceNets;
             _bounds = volumeBounds;

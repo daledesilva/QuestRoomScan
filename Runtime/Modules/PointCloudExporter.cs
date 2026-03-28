@@ -21,6 +21,7 @@ namespace Genesis.RoomScan
         private float _lastExportTime;
         private bool _exporting;
 
+        /// <summary>Absolute path of the exported PLY file on device.</summary>
         public string ExportPath => _plyPath;
 
         /// <summary>
@@ -55,6 +56,9 @@ namespace Genesis.RoomScan
         // GPUVertex layout must match the compute shader: float3 pos, float3 norm, uint packedColor, uint voxelFlatIdx
         private const int GpuVertexStride = 32;
 
+        /// <summary>
+        /// Reads the GPU vertex buffer via async readback and writes a binary PLY point cloud to disk.
+        /// </summary>
         public async Task ExportAsync()
         {
             if (_exporting) return;
@@ -86,7 +90,7 @@ namespace Genesis.RoomScan
                 var req = await AsyncGPUReadback.RequestAsync(vertBuf);
                 if (req.hasError)
                 {
-                    Debug.LogWarning("[RoomScan] PointCloudExporter: GPU readback error");
+                    Logger.Warning("PointCloudExporter: GPU readback error");
                     _exporting = false;
                     return;
                 }
@@ -101,7 +105,7 @@ namespace Genesis.RoomScan
 
                 if (vertCount == 0)
                 {
-                    Debug.Log("[RoomScan] PointCloudExporter: no vertices to export");
+                    Logger.Info("PointCloudExporter: no vertices to export");
                     _exporting = false;
                     return;
                 }
@@ -112,12 +116,12 @@ namespace Genesis.RoomScan
 
                 await Task.Run(() => WritePly(path, data, vertCount));
 
-                Debug.Log($"[RoomScan] PointCloudExporter: saved {vertCount} vertices " +
+                Logger.Info($"PointCloudExporter: saved {vertCount} vertices " +
                           $"(buffer capacity: {bufferCapacity}) to {path} ({new FileInfo(path).Length / 1024}KB)");
             }
             catch (Exception e)
             {
-                Debug.LogError($"[RoomScan] PointCloudExporter: export error: {e.Message}");
+                Logger.Error($"PointCloudExporter: export error: {e.Message}");
             }
             finally
             {

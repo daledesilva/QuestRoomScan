@@ -1,5 +1,3 @@
-using System.Collections.Generic;
-using Genesis.RoomScan.GSplat;
 using UnityEngine;
 using UnityEngine.UIElements;
 
@@ -26,8 +24,8 @@ namespace Genesis.RoomScan.UI
         private VisualElement[] _views;
 
         // Scan view elements
-        private Label _valScanning, _valMode, _valIntegrations, _valKeyframes, _valRender, _valPackage;
-        private Button _btnToggleScan, _btnRenderMode, _btnSaveScan, _btnDeleteArtifact;
+        private Label _valScanning, _valIntegrations, _valKeyframes, _valRender, _valPackage;
+        private Button _btnToggleScan, _btnRenderMode, _btnFreezeTint, _btnSaveScan, _btnDeleteArtifact;
 
         // Saved scans view
         private ScrollView _scanList;
@@ -51,7 +49,7 @@ namespace Genesis.RoomScan.UI
         private Label _valFps;
 
         // Cached state
-        private GSplatServerClient _cachedClient;
+        private IGSplatProvider _cachedGSplat;
         private float _fpsTimer;
         private int _fpsFrames;
         private float _currentFps;
@@ -65,6 +63,9 @@ namespace Genesis.RoomScan.UI
             _follower = GetComponent<DebugMenuFollower>();
         }
 
+        private bool _refineAvailable;
+        private bool _gsplatAvailable;
+
         private void OnEnable()
         {
             _root = _doc.rootVisualElement;
@@ -73,6 +74,7 @@ namespace Genesis.RoomScan.UI
 
             QueryElements();
             BindButtons();
+            UpdateModuleAvailability();
             SelectNav(_navScan);
         }
 
@@ -96,6 +98,7 @@ namespace Genesis.RoomScan.UI
             _visible = true;
             _root.style.display = DisplayStyle.Flex;
             if (_follower != null) _follower.SnapToView();
+            UpdateModuleAvailability();
             PopulateScanList();
             RefreshStatus();
         }
@@ -141,13 +144,14 @@ namespace Genesis.RoomScan.UI
 
             // Scan view
             _valScanning = _root.Q<Label>("val-scanning");
-            _valMode = _root.Q<Label>("val-mode");
+
             _valIntegrations = _root.Q<Label>("val-integrations");
             _valKeyframes = _root.Q<Label>("val-keyframes");
             _valRender = _root.Q<Label>("val-render");
             _valPackage = _root.Q<Label>("val-package");
             _btnToggleScan = _root.Q<Button>("btn-toggle-scan");
             _btnRenderMode = _root.Q<Button>("btn-render-mode");
+            _btnFreezeTint = _root.Q<Button>("btn-freeze-tint");
             _btnSaveScan = _root.Q<Button>("btn-save-scan");
             _btnDeleteArtifact = _root.Q<Button>("btn-delete-artifact");
 
@@ -197,13 +201,12 @@ namespace Genesis.RoomScan.UI
                 RoomScanner.Instance?.ToggleScanning());
 
             _btnRenderMode?.RegisterCallback<ClickEvent>(_ =>
+                RoomScanner.Instance?.CycleRenderMode());
+
+            _btnFreezeTint?.RegisterCallback<ClickEvent>(_ =>
             {
                 var s = RoomScanner.Instance;
-                if (s == null) return;
-                if (s.HasDownloadedSplat && s.CurrentRenderMode == ScanRenderMode.Mesh)
-                    s.LoadDownloadedSplat();
-                else
-                    s.CycleRenderMode();
+                if (s != null) s.ShowFreezeTint = !s.ShowFreezeTint;
             });
 
             _btnSaveScan?.RegisterCallback<ClickEvent>(async _ =>
@@ -231,9 +234,8 @@ namespace Genesis.RoomScan.UI
             // Training
             _fieldServerUrl?.RegisterValueChangedCallback(evt =>
             {
-                if (_cachedClient == null)
-                    _cachedClient = FindAnyObjectByType<GSplatServerClient>();
-                if (_cachedClient != null) _cachedClient.ServerUrl = evt.newValue;
+                EnsureGSplat();
+                if (_cachedGSplat != null) _cachedGSplat.ServerUrl = evt.newValue;
             });
 
             _btnGsTrain?.RegisterCallback<ClickEvent>(_ =>
@@ -241,9 +243,8 @@ namespace Genesis.RoomScan.UI
 
             _btnCancelTrain?.RegisterCallback<ClickEvent>(_ =>
             {
-                if (_cachedClient == null)
-                    _cachedClient = FindAnyObjectByType<GSplatServerClient>();
-                if (_cachedClient == null) return;
+                EnsureGSplat();
+                if (_cachedGSplat == null) return;
                 SetButtonBusy(_btnCancelTrain, "Cancelling...");
                 CancelAndResetButton();
             });
@@ -267,11 +268,34 @@ namespace Genesis.RoomScan.UI
         }
 
         // ─────────────────────────────────────────────────────────────
+        //  Module Availability
+        // ─────────────────────────────────────────────────────────────
+
+        private void UpdateModuleAvailability()
+        {
+            var scanner = RoomScanner.Instance;
+            _refineAvailable = scanner != null && scanner.HasTextureRefinementModule;
+            _gsplatAvailable = scanner != null && scanner.GSplatProvider != null;
+
+            SetNavAvailable(_navRefine, _refineAvailable);
+            SetNavAvailable(_navTraining, _gsplatAvailable);
+        }
+
+        private static void SetNavAvailable(Button btn, bool available)
+        {
+            if (btn == null) return;
+            btn.SetEnabled(available);
+            btn.EnableInClassList("nav-btn--unavailable", !available);
+        }
+
+        // ─────────────────────────────────────────────────────────────
         //  Navigation
         // ─────────────────────────────────────────────────────────────
 
         private void SelectNav(Button selected)
         {
+            if (selected != null && !selected.enabledSelf) return;
+
             for (int i = 0; i < _navButtons.Length; i++)
             {
                 if (_navButtons[i] == null) continue;
@@ -335,6 +359,7 @@ namespace Genesis.RoomScan.UI
             var badges = new VisualElement();
             badges.AddToClassList("scan-entry-badges");
             if (pkg.hasKeyframes) AddBadge(badges, "KF");
+            if (pkg.hasTriplanar) AddBadge(badges, "Tri");
             if (pkg.hasSplat) AddBadge(badges, "Splat");
             if (pkg.hasRefined) AddBadge(badges, "Refined");
             if (pkg.hasEnhancedMesh) AddBadge(badges, "Enh");
@@ -421,7 +446,6 @@ namespace Genesis.RoomScan.UI
         private void RefreshScanView(RoomScanner scanner)
         {
             SetLabel(_valScanning, scanner.IsScanning ? "Active" : "Stopped");
-            SetLabel(_valMode, scanner.Mode.ToString());
             SetLabel(_valRender, scanner.CurrentRenderMode.ToString());
 
             var persistence = RoomScanPersistence.Instance;
@@ -432,12 +456,10 @@ namespace Genesis.RoomScan.UI
                 _btnToggleScan.text = scanner.IsScanning ? "Stop Scanning" : "Start Scanning";
 
             if (_btnRenderMode != null)
-            {
-                string modeLabel = scanner.CurrentRenderMode.ToString();
-                if (scanner.HasDownloadedSplat && scanner.CurrentRenderMode == ScanRenderMode.Mesh)
-                    modeLabel += " [Splat Ready]";
-                _btnRenderMode.text = $"Render: {modeLabel}";
-            }
+                _btnRenderMode.text = $"Render: {scanner.CurrentRenderMode}";
+
+            if (_btnFreezeTint != null)
+                _btnFreezeTint.text = scanner.ShowFreezeTint ? "Freeze Tint: ON" : "Freeze Tint: OFF";
 
             var vi = VolumeIntegrator.Instance;
             if (vi != null) SetLabel(_valIntegrations, vi.IntegrationCount.ToString());
@@ -522,36 +544,35 @@ namespace Genesis.RoomScan.UI
 
         private void RefreshTrainingStatus()
         {
-            if (_cachedClient == null)
-                _cachedClient = FindAnyObjectByType<GSplatServerClient>();
-            if (_cachedClient == null) return;
+            EnsureGSplat();
+            if (_cachedGSplat == null) return;
 
-            if (_fieldServerUrl != null && _fieldServerUrl.value != _cachedClient.ServerUrl)
-                _fieldServerUrl.SetValueWithoutNotify(_cachedClient.ServerUrl);
+            if (_fieldServerUrl != null && _fieldServerUrl.value != _cachedGSplat.ServerUrl)
+                _fieldServerUrl.SetValueWithoutNotify(_cachedGSplat.ServerUrl);
 
-            var ts = _cachedClient.LastStatus;
-            if (ts == null)
+            string state = _cachedGSplat.TrainingState;
+            if (string.IsNullOrEmpty(state))
             {
                 SetLabel(_valTrainState, "No data");
                 return;
             }
 
-            string stateDisplay = ts.state ?? "--";
-            if (_cachedClient.IsUploading) stateDisplay = "Uploading...";
-            else if (_cachedClient.IsDownloading) stateDisplay = "Downloading...";
-            else if (_cachedClient.IsPolling && ts.state == "training") stateDisplay = "Training (polling)";
+            string stateDisplay = state;
+            if (_cachedGSplat.IsUploading) stateDisplay = "Uploading...";
+            else if (_cachedGSplat.IsDownloading) stateDisplay = "Downloading...";
+            else if (_cachedGSplat.IsPolling && state == "training") stateDisplay = "Training (polling)";
             SetLabel(_valTrainState, stateDisplay);
 
-            float pct = ts.progress * 100f;
+            float pct = _cachedGSplat.TrainingProgress * 100f;
             if (_progressFill != null)
                 _progressFill.style.width = new Length(pct, LengthUnit.Percent);
             SetLabel(_valTrainProgress, $"{pct:F0}%");
 
-            SetLabel(_valTrainIter, ts.total_iterations > 0
-                ? $"{ts.current_iteration} / {ts.total_iterations}" : "--");
-            SetLabel(_valTrainElapsed, ts.elapsed_seconds > 0 ? FormatElapsed(ts.elapsed_seconds) : "--");
-            SetLabel(_valTrainBackend, string.IsNullOrEmpty(ts.backend) ? "--" : ts.backend);
-            SetLabel(_valTrainMessage, string.IsNullOrEmpty(ts.message) ? "--" : ts.message);
+            SetLabel(_valTrainIter, _cachedGSplat.TotalIterations > 0
+                ? $"{_cachedGSplat.CurrentIteration} / {_cachedGSplat.TotalIterations}" : "--");
+            SetLabel(_valTrainElapsed, _cachedGSplat.ElapsedSeconds > 0 ? FormatElapsed(_cachedGSplat.ElapsedSeconds) : "--");
+            SetLabel(_valTrainBackend, string.IsNullOrEmpty(_cachedGSplat.TrainingBackend) ? "--" : _cachedGSplat.TrainingBackend);
+            SetLabel(_valTrainMessage, string.IsNullOrEmpty(_cachedGSplat.TrainingMessage) ? "--" : _cachedGSplat.TrainingMessage);
         }
 
         private void RefreshDisabledStates(RoomScanner scanner)
@@ -565,35 +586,34 @@ namespace Genesis.RoomScan.UI
             if (_btnSaveScan != null && !_btnSaveScan.text.Contains("..."))
                 _btnSaveScan.SetEnabled(hasVolume);
 
-            // Start GS Training: disabled if already training or no data
+            // GS Training: entirely disabled if module absent
             if (_btnGsTrain != null)
             {
-                bool canTrain = !scanner.IsGsTrainingInProgress && (hasVolume || hasActivePackage);
+                bool canTrain = _gsplatAvailable && !scanner.IsGsTrainingInProgress && (hasVolume || hasActivePackage);
                 _btnGsTrain.SetEnabled(canTrain);
             }
 
-            // Cancel Training
-            bool isTraining = _cachedClient?.LastStatus?.state == "training";
+            bool isTraining = _cachedGSplat?.TrainingState == "training";
             if (_btnCancelTrain != null && !_btnCancelTrain.text.Contains("..."))
                 _btnCancelTrain.SetEnabled(isTraining);
 
-            // Refine: disabled if already refining or no mesh/keyframes
+            // Refine: entirely disabled if module absent
             if (_btnRefineTex != null && !scanner.IsRefining)
-                _btnRefineTex.SetEnabled(hasVolume || hasActivePackage);
+                _btnRefineTex.SetEnabled(_refineAvailable && (hasVolume || hasActivePackage));
 
             if (_btnHqRefine != null && !scanner.IsHQRefining)
             {
-                bool hasServer = _cachedClient != null &&
-                    !string.IsNullOrEmpty(_cachedClient.ServerUrl);
-                _btnHqRefine.SetEnabled((hasVolume || hasActivePackage) && hasServer);
+                bool hasServer = _cachedGSplat != null &&
+                    !string.IsNullOrEmpty(_cachedGSplat.ServerUrl);
+                _btnHqRefine.SetEnabled(_refineAvailable && (hasVolume || hasActivePackage) && hasServer);
             }
 
             if (_btnMeshEnhance != null && !scanner.IsMeshEnhancing)
             {
-                bool hasServer = _cachedClient != null &&
-                    !string.IsNullOrEmpty(_cachedClient.ServerUrl);
+                bool hasServer = _cachedGSplat != null &&
+                    !string.IsNullOrEmpty(_cachedGSplat.ServerUrl);
                 bool hasRefined = scanner.HasRefinedTexture || scanner.LastRefinedResult.HasValue;
-                _btnMeshEnhance.SetEnabled(hasRefined && hasServer);
+                _btnMeshEnhance.SetEnabled(_refineAvailable && hasRefined && hasServer);
             }
 
             // Export Point Cloud: disabled if no volume
@@ -634,9 +654,24 @@ namespace Genesis.RoomScan.UI
 
         private async void CancelAndResetButton()
         {
-            if (_cachedClient != null)
-                await _cachedClient.CancelTraining();
+            if (_cachedGSplat != null)
+                await _cachedGSplat.CancelTraining();
             SetButtonReady(_btnCancelTrain, "Cancel Training");
+        }
+
+        private void EnsureGSplat()
+        {
+            if (_cachedGSplat != null) return;
+            var scanner = RoomScanner.Instance;
+            if (scanner == null) return;
+            foreach (var c in scanner.GetComponents<MonoBehaviour>())
+            {
+                if (c is IGSplatProvider provider)
+                {
+                    _cachedGSplat = provider;
+                    return;
+                }
+            }
         }
 
         private static void SetButtonBusy(Button btn, string text)

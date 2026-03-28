@@ -43,8 +43,13 @@ namespace Genesis.RoomScan
         private float _lastCaptureTime;
         private bool _initialized;
 
+        /// <summary>Number of keyframes saved so far in this session.</summary>
         public int SavedCount => _nextId;
+
+        /// <summary>Absolute path to the keyframe export directory on device.</summary>
         public string ExportDirectory => _exportDir;
+
+        private RoomScanner _scanner;
 
         private void Start()
         {
@@ -58,7 +63,23 @@ namespace Genesis.RoomScan
             _prevRotTime = Time.time;
             _initialized = true;
 
-            Debug.Log($"[RoomScan] KeyframeCollector: export dir={_exportDir}");
+            _scanner = GetComponent<RoomScanner>();
+            if (_scanner != null)
+                _scanner.ColorFrameProvided += OnColorFrame;
+
+            Logger.Info($"KeyframeCollector: export dir={_exportDir}");
+        }
+
+        private void OnColorFrame(Texture frame, Pose pose, Vector2 focal, Vector2 principal,
+            Vector2 sensor, Vector2 current)
+        {
+            TrySaveKeyframe(frame, pose.position, pose.rotation, focal, principal, sensor, current);
+        }
+
+        private void OnDestroy()
+        {
+            if (_scanner != null)
+                _scanner.ColorFrameProvided -= OnColorFrame;
         }
 
         /// <summary>
@@ -123,7 +144,7 @@ namespace Genesis.RoomScan
             _pendingWrites--;
             if (req.hasError)
             {
-                Debug.LogWarning($"[RoomScan] KeyframeCollector: readback error for frame {id}");
+                Logger.Warning($"KeyframeCollector: readback error for frame {id}");
                 return;
             }
 
@@ -141,7 +162,7 @@ namespace Genesis.RoomScan
             }
             catch (Exception e)
             {
-                Debug.LogError($"[RoomScan] KeyframeCollector: encode error frame {id}: {e.Message}");
+                Logger.Error($"KeyframeCollector: encode error frame {id}: {e.Message}");
             }
         }
 
@@ -182,11 +203,11 @@ namespace Genesis.RoomScan
                     }
 
                     if (id < 5 || id % 50 == 0)
-                        Debug.Log($"[RoomScan] KeyframeCollector: saved frame {id} ({jpgBytes.Length / 1024}KB)");
+                        Logger.Info($"KeyframeCollector: saved frame {id} ({jpgBytes.Length / 1024}KB)");
                 }
                 catch (Exception e)
                 {
-                    Debug.LogError($"[RoomScan] KeyframeCollector: write error frame {id}: {e.Message}");
+                    Logger.Error($"KeyframeCollector: write error frame {id}: {e.Message}");
                 }
             });
         }
@@ -208,7 +229,7 @@ namespace Genesis.RoomScan
         public void ReinitExportDir()
         {
             Directory.CreateDirectory(_imagesDir);
-            Debug.Log("[RoomScan] KeyframeCollector: export cleared");
+            Logger.Info("KeyframeCollector: export cleared");
         }
 
         /// <summary>
@@ -221,7 +242,7 @@ namespace Genesis.RoomScan
                 Directory.Delete(_exportDir, true);
             Directory.CreateDirectory(_imagesDir);
             ClearInMemory();
-            Debug.Log("[RoomScan] KeyframeCollector: export cleared");
+            Logger.Info("KeyframeCollector: export cleared");
         }
     }
 }

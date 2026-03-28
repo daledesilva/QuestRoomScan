@@ -7,7 +7,7 @@ namespace Genesis.RoomScan
     /// Deprecated on Quest (use PassthroughCameraProvider instead),
     /// but useful for editor testing or non-Quest XR platforms.
     /// </summary>
-    public class WebCamProvider : MonoBehaviour, ICameraProvider
+    internal class WebCamProvider : MonoBehaviour, ICameraProvider
     {
         [SerializeField] private int requestedWidth = 1280;
         [SerializeField] private int requestedHeight = 960;
@@ -23,9 +23,10 @@ namespace Genesis.RoomScan
         private Transform _headTransform;
 
         public bool IsReady => _webcamTex != null && _webcamTex.isPlaying && _webcamTex.didUpdateThisFrame;
+        public bool IsPlaying => _webcamTex != null && _webcamTex.isPlaying;
         public Texture CurrentFrame => _webcamTex;
 
-        public Matrix4x4 CameraToWorld
+        public Pose CameraPose
         {
             get
             {
@@ -34,31 +35,18 @@ namespace Genesis.RoomScan
                     var cam = Camera.main;
                     _headTransform = cam != null ? cam.transform : transform;
                 }
-                return _headTransform.localToWorldMatrix;
+                return new Pose(_headTransform.position, _headTransform.rotation);
             }
         }
 
-        public Matrix4x4 ProjectionMatrix
-        {
-            get
-            {
-                float w = _webcamTex != null ? _webcamTex.width : requestedWidth;
-                float h = _webcamTex != null ? _webcamTex.height : requestedHeight;
+        public Vector2 FocalLength => new(focalLengthX, focalLengthY);
+        public Vector2 PrincipalPoint => new(principalPointX, principalPointY);
 
-                const float near = 0.1f;
-                const float far = 100f;
+        public Vector2 SensorResolution =>
+            new(_webcamTex != null ? _webcamTex.width : requestedWidth,
+                _webcamTex != null ? _webcamTex.height : requestedHeight);
 
-                Matrix4x4 proj = Matrix4x4.zero;
-                proj.m00 = 2f * focalLengthX / w;
-                proj.m11 = 2f * focalLengthY / h;
-                proj.m02 = 1f - 2f * principalPointX / w;
-                proj.m12 = 2f * principalPointY / h - 1f;
-                proj.m22 = -(far + near) / (far - near);
-                proj.m23 = -2f * far * near / (far - near);
-                proj.m32 = -1f;
-                return proj;
-            }
-        }
+        public Vector2 CurrentResolution => SensorResolution;
 
         public void StartCapture()
         {
@@ -67,7 +55,7 @@ namespace Genesis.RoomScan
             WebCamDevice[] devices = WebCamTexture.devices;
             if (devices.Length == 0)
             {
-                Debug.LogWarning("[RoomScan] No webcam devices found");
+                Logger.Warning("No webcam devices found");
                 return;
             }
 

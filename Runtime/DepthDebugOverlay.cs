@@ -3,7 +3,7 @@ using UnityEngine.UI;
 
 namespace Genesis.RoomScan
 {
-    public class DepthDebugOverlay : MonoBehaviour
+    internal class DepthDebugOverlay : MonoBehaviour
     {
         [SerializeField] private float canvasDistance = 1.5f;
         [SerializeField] private float canvasScale = 0.001f;
@@ -38,10 +38,10 @@ namespace Genesis.RoomScan
             if (shader != null)
                 _depthMat = new Material(shader);
             else
-                Debug.LogWarning("[RoomScan] DepthDebugOverlay: Genesis/DepthVisualize shader not found");
+                Logger.Warning("DepthDebugOverlay: Genesis/DepthVisualize shader not found");
 
             CreateCanvas();
-            Debug.Log($"[RoomScan] DepthDebugOverlay: depthCapture={DepthCapture.Instance != null}, mat={_depthMat != null}");
+            Logger.Info($"DepthDebugOverlay: depthCapture={DepthCapture.Instance != null}, mat={_depthMat != null}");
         }
 
         private void CreateCanvas()

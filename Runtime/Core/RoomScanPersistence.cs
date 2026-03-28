@@ -14,12 +14,13 @@ namespace Genesis.RoomScan
     // ─────────────────────────────────────────────────────────────
 
     [Serializable]
-    public class ScanPackageEntry
+    internal class ScanPackageEntry
     {
         public string id;
         public string displayName;
         public long timestamp;
         public string anchorUuid;
+        public bool hasTriplanar;
         public bool hasSplat;
         public bool hasRefined;
         public bool hasHQRefined;
@@ -28,13 +29,13 @@ namespace Genesis.RoomScan
     }
 
     [Serializable]
-    public class ScanPackageManifest
+    internal class ScanPackageManifest
     {
         public int version = 1;
         public List<ScanPackageEntry> packages = new();
     }
 
-    public enum ArtifactType { Splat, Refined, HQRefined, EnhancedMesh }
+    internal enum ArtifactType { Splat, Refined, HQRefined, EnhancedMesh }
 
     /// <summary>
     /// Per-artifact anchor matrices. All matrices are from localizing the same
@@ -42,7 +43,7 @@ namespace Genesis.RoomScan
     /// localToWorldMatrix at the time it was created / saved to disk.
     /// </summary>
     [Serializable]
-    public class PackageAnchorData
+    internal class PackageAnchorData
     {
         public string anchorUuid;
         public float[] baseMatrixAtSave;
@@ -53,19 +54,37 @@ namespace Genesis.RoomScan
 
     // ─────────────────────────────────────────────────────────────
 
-    public class RoomScanPersistence : MonoBehaviour
+    /// <summary>
+    /// Manages saving and loading scan packages (TSDF volume, triplanar textures, keyframes,
+    /// splat PLYs, refined meshes) to persistent storage with spatial-anchor–based relocation.
+    /// Each scan is stored as a versioned package directory under <c>RoomScans/</c>.
+    /// </summary>
+    public class RoomScanPersistence : MonoBehaviour, IRoomScanModule
     {
+        /// <summary>Singleton instance set in <see cref="Awake"/>.</summary>
         public static RoomScanPersistence Instance { get; private set; }
+
+        /// <inheritdoc />
+        public string ModuleName => "Room Persistence";
+
+        /// <inheritdoc />
+        public void OnModuleInitialize(RoomScanner scanner) { }
 
         private const uint Magic = 0x48534D52; // "RMSH"
         private const int FormatVersion = 1;
         private const uint RefinedMeshMagic = 0x46524D52; // "RMRF"
         private const int RefinedMeshVersion = 1;
 
+        /// <summary>True while an async save operation is in progress.</summary>
         public bool IsSaving { get; private set; }
+
+        /// <summary>True while an async load operation is in progress.</summary>
         public bool IsLoading { get; private set; }
 
+        /// <summary>Raised on the main thread after a package save completes successfully.</summary>
         public event Action SaveCompleted;
+
+        /// <summary>Raised on the main thread after a package load completes successfully.</summary>
         public event Action LoadCompleted;
 
         /// <summary>Currently active package ID (set after save or load).</summary>
@@ -77,6 +96,7 @@ namespace Genesis.RoomScan
         private string RoomScansRoot => Path.Combine(Application.persistentDataPath, "RoomScans");
         private string ManifestPath => Path.Combine(RoomScansRoot, "manifest.json");
 
+        /// <summary>Absolute path to the active package's directory, or null if no package is active.</summary>
         public string ActivePackageDirectory =>
             HasActivePackage ? Path.Combine(RoomScansRoot, ActivePackageId) : null;
 
@@ -103,7 +123,8 @@ namespace Genesis.RoomScan
         //  Manifest I/O
         // ─────────────────────────────────────────────────────────────
 
-        public ScanPackageManifest ReadManifest()
+        /// <summary>Reads and deserializes the package manifest from disk. Returns an empty manifest on failure.</summary>
+        internal ScanPackageManifest ReadManifest()
         {
             if (!File.Exists(ManifestPath))
                 return new ScanPackageManifest();
@@ -114,7 +135,7 @@ namespace Genesis.RoomScan
             }
             catch (Exception e)
             {
-                Debug.LogWarning($"[Persistence] Failed to read manifest: {e.Message}");
+                Logger.Warning($"Failed to read manifest: {e.Message}");
                 return new ScanPackageManifest();
             }
         }
@@ -126,13 +147,15 @@ namespace Genesis.RoomScan
             File.WriteAllText(ManifestPath, JsonUtility.ToJson(manifest, true));
         }
 
-        public List<ScanPackageEntry> ListPackages()
+        /// <summary>Returns all saved scan packages sorted newest-first.</summary>
+        internal List<ScanPackageEntry> ListPackages()
         {
             var manifest = ReadManifest();
             manifest.packages.Sort((a, b) => b.timestamp.CompareTo(a.timestamp));
             return manifest.packages;
         }
 
+        /// <summary>Returns true if at least one scan package exists on disk.</summary>
         public bool HasAnyPackage()
         {
             var manifest = ReadManifest();
@@ -180,15 +203,19 @@ namespace Genesis.RoomScan
         //  Save — creates a new package with base scan data
         // ─────────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Creates a new package directory, reads TSDF/color volumes from GPU, saves scan.bin,
+        /// anchor data, triplanar textures, and keyframes. Sets <see cref="ActivePackageId"/> on success.
+        /// </summary>
         public async Task<bool> SaveToNewPackageAsync()
         {
             var vi = VolumeIntegrator.Instance;
             if (vi == null || vi.Volume == null)
             {
-                Debug.LogWarning("[Persistence] Cannot save, no volume");
+                Logger.Warning("Cannot save, no volume");
                 return false;
             }
-            if (IsSaving) { Debug.LogWarning("[Persistence] Save already in progress"); return false; }
+            if (IsSaving) { Logger.Warning("Save already in progress"); return false; }
 
             IsSaving = true;
             try
@@ -201,7 +228,7 @@ namespace Genesis.RoomScan
 
                 // GPU readback TSDF
                 var tsdfReq = await AsyncGPUReadback.RequestAsync(vi.Volume, 0);
-                if (tsdfReq.hasError) { Debug.LogError("[Persistence] TSDF readback failed"); return false; }
+                if (tsdfReq.hasError) { Logger.Error("TSDF readback failed"); return false; }
                 byte[] tsdfBytes = new byte[s.x * s.y * s.z * 2];
                 for (int z = 0; z < s.z; z++)
                 {
@@ -211,7 +238,7 @@ namespace Genesis.RoomScan
 
                 // GPU readback color
                 var colorReq = await AsyncGPUReadback.RequestAsync(vi.ColorVolume, 0);
-                if (colorReq.hasError) { Debug.LogError("[Persistence] Color readback failed"); return false; }
+                if (colorReq.hasError) { Logger.Error("Color readback failed"); return false; }
                 byte[] colorBytes = new byte[s.x * s.y * s.z * 4];
                 for (int z = 0; z < s.z; z++)
                 {
@@ -235,12 +262,12 @@ namespace Genesis.RoomScan
                     {
                         anchorUuidStr = result.Value.uuid.ToString();
                         anchorMatrix = result.Value.matrix;
-                        Debug.Log($"[Persistence] Spatial anchor created for package: {anchorUuidStr}");
+                        Logger.Info($"Spatial anchor created for package: {anchorUuidStr}");
                     }
                     else
                     {
                         anchorMatrix = roomAnchor.GetRoomLocalToWorldForPersistence();
-                        Debug.LogWarning("[Persistence] Spatial anchor creation failed, using MRUK fallback matrix");
+                        Logger.Warning("Spatial anchor creation failed, using MRUK fallback matrix");
                     }
                 }
 
@@ -274,7 +301,7 @@ namespace Genesis.RoomScan
                 if (Directory.Exists(gsExportDir))
                 {
                     await Task.Run(() => CopyDirectoryContents(gsExportDir, kfDir));
-                    Debug.Log("[Persistence] Keyframes copied to package");
+                    Logger.Info("Keyframes copied to package");
                 }
 
                 // Update manifest
@@ -287,6 +314,7 @@ namespace Genesis.RoomScan
                     displayName = $"Scan {DateTime.Now:MMM dd HH:mm}",
                     timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                     anchorUuid = anchorUuidStr,
+                    hasTriplanar = triRes > 0,
                     hasKeyframes = hasKf
                 });
                 WriteManifest(manifest);
@@ -295,14 +323,14 @@ namespace Genesis.RoomScan
                 _activeAnchorData = anchorData;
 
                 float sizeMB = new FileInfo(scanBinPath).Length / (1024f * 1024f);
-                Debug.Log($"[Persistence] Package saved: {pkgId} ({sizeMB:F1}MB), " +
+                Logger.Info($"Package saved: {pkgId} ({sizeMB:F1}MB), " +
                           $"triplanar={triRes > 0}, keyframes={hasKf}, anchor={anchorUuidStr}");
                 SaveCompleted?.Invoke();
                 return true;
             }
             catch (Exception e)
             {
-                Debug.LogError($"[Persistence] Save failed: {e.Message}\n{e.StackTrace}");
+                Logger.Error($"Save failed: {e.Message}\n{e.StackTrace}");
                 return false;
             }
             finally { IsSaving = false; }
@@ -312,12 +340,16 @@ namespace Genesis.RoomScan
         //  Save artifact to active package
         // ─────────────────────────────────────────────────────────────
 
-        public async Task<bool> SaveArtifactAsync(ArtifactType type, byte[] data,
+        /// <summary>
+        /// Persists an artifact (splat, refined mesh, HQ atlas, enhanced mesh) to the active package.
+        /// Updates anchor.json with the current anchor matrix and the manifest flags.
+        /// </summary>
+        internal async Task<bool> SaveArtifactAsync(ArtifactType type, byte[] data,
             RefinedTextureResult? refinedResult = null)
         {
             if (!HasActivePackage)
             {
-                Debug.LogWarning("[Persistence] No active package — artifact stays in memory only");
+                Logger.Warning("No active package — artifact stays in memory only");
                 return false;
             }
 
@@ -333,7 +365,7 @@ namespace Genesis.RoomScan
                         await Task.Run(() => File.WriteAllBytes(splatPath, data));
                         if (_activeAnchorData != null)
                             _activeAnchorData.splatMatrixAtCreate = MatrixToFloats(currentMatrix);
-                        Debug.Log($"[Persistence] Splat auto-saved ({data.Length / (1024f * 1024f):F1}MB)");
+                        Logger.Info($"Splat auto-saved ({data.Length / (1024f * 1024f):F1}MB)");
                         break;
 
                     case ArtifactType.Refined:
@@ -350,7 +382,7 @@ namespace Genesis.RoomScan
                         }
                         if (_activeAnchorData != null)
                             _activeAnchorData.refinedMatrixAtCreate = MatrixToFloats(currentMatrix);
-                        Debug.Log("[Persistence] Refined texture auto-saved");
+                        Logger.Info("Refined texture auto-saved");
                         break;
 
                     case ArtifactType.HQRefined:
@@ -358,7 +390,7 @@ namespace Genesis.RoomScan
                         await Task.Run(() => File.WriteAllBytes(hqPath, data));
                         if (_activeAnchorData != null)
                             _activeAnchorData.hqMatrixAtCreate = MatrixToFloats(currentMatrix);
-                        Debug.Log("[Persistence] HQ atlas auto-saved (PNG)");
+                        Logger.Info("HQ atlas auto-saved (PNG)");
                         break;
 
                     case ArtifactType.EnhancedMesh:
@@ -369,7 +401,7 @@ namespace Genesis.RoomScan
                         }
                         if (_activeAnchorData != null)
                             _activeAnchorData.refinedMatrixAtCreate = MatrixToFloats(currentMatrix);
-                        Debug.Log("[Persistence] Enhanced mesh auto-saved");
+                        Logger.Info("Enhanced mesh auto-saved");
                         break;
                 }
 
@@ -384,7 +416,7 @@ namespace Genesis.RoomScan
             }
             catch (Exception e)
             {
-                Debug.LogError($"[Persistence] Artifact save failed: {e.Message}\n{e.StackTrace}");
+                Logger.Error($"Artifact save failed: {e.Message}\n{e.StackTrace}");
                 return false;
             }
         }
@@ -392,7 +424,7 @@ namespace Genesis.RoomScan
         /// <summary>
         /// Deletes a specific artifact from the active package on disk and in memory.
         /// </summary>
-        public void DeleteArtifactFromPackage(ArtifactType type)
+        internal void DeleteArtifactFromPackage(ArtifactType type)
         {
             if (!HasActivePackage) return;
             string pkgDir = ActivePackageDirectory;
@@ -420,20 +452,24 @@ namespace Genesis.RoomScan
             if (_activeAnchorData != null)
                 WriteAnchorData(Path.Combine(pkgDir, "anchor.json"), _activeAnchorData);
             UpdateManifestFlags(ActivePackageId, type, false);
-            Debug.Log($"[Persistence] Artifact {type} deleted from {ActivePackageId}");
+            Logger.Info($"Artifact {type} deleted from {ActivePackageId}");
         }
 
         // ─────────────────────────────────────────────────────────────
         //  Load package
         // ─────────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// Loads a saved scan package by ID: restores TSDF/color volumes, triplanar textures,
+        /// splat, refined mesh, and HQ atlas. Applies spatial-anchor relocation if available.
+        /// </summary>
         public async Task<bool> LoadPackageAsync(string pkgId)
         {
             string pkgDir = Path.Combine(RoomScansRoot, pkgId);
             string scanBinPath = Path.Combine(pkgDir, "scan.bin");
             if (!File.Exists(scanBinPath))
             {
-                Debug.LogWarning($"[Persistence] Package {pkgId} has no scan.bin");
+                Logger.Warning($"Package {pkgId} has no scan.bin");
                 return false;
             }
 
@@ -441,10 +477,10 @@ namespace Genesis.RoomScan
             var cm = MeshExtractor.Instance;
             if (vi == null || vi.Volume == null)
             {
-                Debug.LogWarning("[Persistence] Cannot load, no volume");
+                Logger.Warning("Cannot load, no volume");
                 return false;
             }
-            if (IsLoading) { Debug.LogWarning("[Persistence] Load already in progress"); return false; }
+            if (IsLoading) { Logger.Warning("Load already in progress"); return false; }
 
             IsLoading = true;
             try
@@ -475,7 +511,7 @@ namespace Genesis.RoomScan
                 if (math.any(savedVoxCount != currentVox) ||
                     Mathf.Abs(savedVoxSize - vi.VoxelSize) > 0.001f)
                 {
-                    Debug.LogWarning($"[Persistence] Voxel mismatch saved={savedVoxCount}/{savedVoxSize} " +
+                    Logger.Warning($"Voxel mismatch saved={savedVoxCount}/{savedVoxSize} " +
                                      $"current={currentVox}/{vi.VoxelSize}");
                     return false;
                 }
@@ -502,7 +538,7 @@ namespace Genesis.RoomScan
                     {
                         anchorNow = loadedMatrix.Value;
                         spatialAnchorOk = true;
-                        Debug.Log("[Persistence] Spatial anchor localized for relocation");
+                        Logger.Info("Spatial anchor localized for relocation");
                     }
                 }
 
@@ -511,7 +547,7 @@ namespace Genesis.RoomScan
                 {
                     if (!roomAnchor.IsRoomLoaded)
                     {
-                        Debug.Log("[Persistence] Waiting for MRUK room...");
+                        Logger.Info("Waiting for MRUK room...");
                         for (int i = 0; i < 300 && !roomAnchor.IsRoomLoaded; i++)
                         {
                             await Task.Delay(16);
@@ -535,7 +571,7 @@ namespace Genesis.RoomScan
                             prev = cur;
                         }
                         anchorNow = roomAnchor.GetRoomLocalToWorldForPersistence();
-                        Debug.LogWarning("[Persistence] Using MRUK fallback for relocation");
+                        Logger.Warning("Using MRUK fallback for relocation");
                     }
                 }
 
@@ -562,7 +598,7 @@ namespace Genesis.RoomScan
                 if (relocVolume != Matrix4x4.identity)
                 {
                     vi.BakeRelocation(relocVolume);
-                    Debug.Log("[Persistence] TSDF bake-relocated");
+                    Logger.Info("TSDF bake-relocated");
                 }
 
                 // Triplanar
@@ -581,7 +617,7 @@ namespace Genesis.RoomScan
                     }
                     catch (Exception e)
                     {
-                        Debug.LogWarning($"[Persistence] Triplanar load skipped ({e.Message})");
+                        Logger.Warning($"Triplanar load skipped ({e.Message})");
                     }
                 }
 
@@ -602,28 +638,24 @@ namespace Genesis.RoomScan
                         await Task.Run(() => plyBytes = File.ReadAllBytes(splatPath));
                         await SwitchToUnityMainThreadAsync(unitySync);
 
-                        var gm = scanner?.GetComponent<GSplat.GSplatManager>();
-                        if (gm != null && plyBytes != null && plyBytes.Length > 0)
+                        var gsplat = scanner?.GSplatProvider;
+                        if (gsplat != null && plyBytes != null && plyBytes.Length > 0)
                         {
-                            gm.LoadTrainedPly(plyBytes);
-                            gm.RenderVisible = scanner.CurrentRenderMode == ScanRenderMode.Splat;
+                            gsplat.LoadTrainedPly(plyBytes);
+                            gsplat.RenderVisible = scanner.CurrentRenderMode == ScanRenderMode.Splat;
                             scanner.DownloadedPlyData = plyBytes;
 
-                            if (relocSplat != Matrix4x4.identity && gm.SplatHolder != null)
-                            {
-                                gm.SplatHolder.SetPositionAndRotation(
-                                    new Vector3(relocSplat.m03, relocSplat.m13, relocSplat.m23),
-                                    relocSplat.rotation);
-                            }
+                            if (relocSplat != Matrix4x4.identity)
+                                gsplat.ApplySplatRelocation(relocSplat);
                             else
-                                gm.ResetSplatTransform();
+                                gsplat.ResetSplatTransform();
 
-                            Debug.Log($"[Persistence] Splat loaded ({plyBytes.Length / (1024f * 1024f):F1}MB)");
+                            Logger.Info($"Splat loaded ({plyBytes.Length / (1024f * 1024f):F1}MB)");
                         }
                     }
                     catch (Exception e)
                     {
-                        Debug.LogWarning($"[Persistence] Splat load skipped ({e.Message})");
+                        Logger.Warning($"Splat load skipped ({e.Message})");
                     }
                 }
 
@@ -691,14 +723,14 @@ namespace Genesis.RoomScan
                                 mesh.SetTriangles(displayData.Indices, 0);
 
                                 scanner.ApplyRefinedTexture(atlasTex, mesh);
-                                Debug.Log($"[Persistence] Refined atlas loaded ({meshData.AtlasWidth}x{meshData.AtlasHeight})" +
+                                Logger.Info($"Refined atlas loaded ({meshData.AtlasWidth}x{meshData.AtlasHeight})" +
                                           (loadedEnhanced ? " [enhanced mesh]" : ""));
                             }
                         }
                     }
                     catch (Exception e)
                     {
-                        Debug.LogWarning($"[Persistence] Refined load skipped ({e.Message})");
+                        Logger.Warning($"Refined load skipped ({e.Message})");
                     }
                 }
 
@@ -715,17 +747,17 @@ namespace Genesis.RoomScan
                         if (ImageConversion.LoadImage(hqTex, hqBytes))
                         {
                             scanner?.ApplyHQTexture(hqTex);
-                            Debug.Log($"[Persistence] HQ atlas loaded ({hqTex.width}x{hqTex.height})");
+                            Logger.Info($"HQ atlas loaded ({hqTex.width}x{hqTex.height})");
                         }
                         else
                         {
                             UnityEngine.Object.Destroy(hqTex);
-                            Debug.LogWarning("[Persistence] HQ atlas PNG decode failed");
+                            Logger.Warning("HQ atlas PNG decode failed");
                         }
                     }
                     catch (Exception e)
                     {
-                        Debug.LogWarning($"[Persistence] HQ load skipped ({e.Message})");
+                        Logger.Warning($"HQ load skipped ({e.Message})");
                     }
                 }
 
@@ -735,14 +767,14 @@ namespace Genesis.RoomScan
                     baseMatrixAtSave = MatrixToFloats(anchorAtSave)
                 };
 
-                Debug.Log($"[Persistence] Package loaded: {pkgId} (integ={savedIntCount}, " +
+                Logger.Info($"Package loaded: {pkgId} (integ={savedIntCount}, " +
                           $"splat={File.Exists(splatPath)}, refined={hasMesh}, hq={hasHQ})");
                 LoadCompleted?.Invoke();
                 return true;
             }
             catch (Exception e)
             {
-                Debug.LogError($"[Persistence] Load failed: {e.Message}\n{e.StackTrace}");
+                Logger.Error($"Load failed: {e.Message}\n{e.StackTrace}");
                 return false;
             }
             finally { IsLoading = false; }
@@ -752,6 +784,7 @@ namespace Genesis.RoomScan
         //  Delete package
         // ─────────────────────────────────────────────────────────────
 
+        /// <summary>Deletes a package's directory, erases its spatial anchor, and removes it from the manifest.</summary>
         public async Task DeletePackageAsync(string pkgId)
         {
             string pkgDir = Path.Combine(RoomScansRoot, pkgId);
@@ -785,9 +818,10 @@ namespace Genesis.RoomScan
                 _activeAnchorData = null;
             }
 
-            Debug.Log($"[Persistence] Package deleted: {pkgId}");
+            Logger.Info($"Package deleted: {pkgId}");
         }
 
+        /// <summary>Clears the in-memory active package reference without deleting files on disk.</summary>
         public void ClearActivePackage()
         {
             ActivePackageId = null;
@@ -827,7 +861,7 @@ namespace Genesis.RoomScan
         private static void TryDeleteFile(string path)
         {
             try { if (File.Exists(path)) File.Delete(path); }
-            catch (Exception e) { Debug.LogWarning($"[Persistence] Delete failed: {path} — {e.Message}"); }
+            catch (Exception e) { Logger.Warning($"Delete failed: {path} — {e.Message}"); }
         }
 
         private static void CopyDirectoryContents(string src, string dst)
@@ -1013,7 +1047,7 @@ namespace Genesis.RoomScan
         {
             if (captured == null)
             {
-                Debug.LogWarning("[Persistence] No SynchronizationContext; MainThreadAsync fallback");
+                Logger.Warning("No SynchronizationContext; MainThreadAsync fallback");
                 return MainThreadAsyncAsTask();
             }
             if (ReferenceEquals(captured, SynchronizationContext.Current))

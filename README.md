@@ -53,7 +53,7 @@ Real-time 3D room reconstruction on Meta Quest 3. Produces a textured mesh from 
 - **Mesh Enhancement** — Server-side mesh smoothing via bilateral normal filter + optional RANSAC plane detection and vertex snapping. Enhanced mesh saved as a separate artifact preserving the original refined mesh.
 - **Render Mode Switching** — Cycle between Wireframe, Vertex, Triplanar, Refined, HQRefined, Splat, and None at runtime via debug menu or controller binding (default: A/X button). Unavailable modes are automatically skipped during cycling (e.g., Triplanar requires `TriplanarCache`, Splat requires trained data).
 - **Freeze Tint Toggle** — Independent toggle (not tied to render mode) shows/hides a blue tint overlay on frozen voxels in live mesh modes (Vertex, Triplanar, Wireframe). Bindable via `RoomScanInputHandler`.
-- **Game Integration APIs** — `LoadRefinedOnlyAsync()` for fast game-mode loading (skips TSDF/Surface Nets reconstruction, loads only the baked mesh + atlas). `ReleaseScanResources()` frees ~400-500 MB GPU memory after scanning. Public `RefinedMesh`/`RefinedAtlas` properties and `RefinedMeshReady` event for custom rendering. `ScanCoverage`/`ScanProgress` structs expose scan metrics for guided UX.
+- **Game Integration APIs** — `RoomScanSession` provides a high-level facade: `StartScan()` → `await FinalizeScanAsync()` → `ScanResult` with mesh + atlas. `LoadLatestAsync()` for instant game-mode loading. For finer control: `LoadRefinedOnlyAsync()`, `ReleaseScanResources()`, public `RefinedMesh`/`RefinedAtlas` properties, `RefinedMeshReady` event, and `ScanCoverage`/`ScanProgress` metrics for guided UX.
 - **Post-Bake Mesh Simplification** — UV-preserving mesh simplification via `meshopt_simplifyWithAttributes` runs after atlas baking (configurable ratio), preserving texture quality. Replaces the old broken pre-bake decimation.
 
 ## Requirements
@@ -246,6 +246,7 @@ RoomScanner (orchestrator, events, scan lifecycle)
   ├── TriplanarCache (bake camera RGB → 3 world-space textures + depth maps)
   ├── TextureRefinement (GPU readback → xatlas UV unwrap → multi-view atlas bake)
   │     └── requires KeyframeCollector (auto-added)
+  ├── RoomScanSession (high-level facade for game integration — see Game Integration Guide)
   └── [separate assembly] GSplatManager + GSplatServerClient (Gaussian Splat training & rendering)
         └── requires KeyframeCollector (auto-added)
 ```
@@ -411,7 +412,38 @@ QuestRoomScan is best suited for developers who need to integrate room scanning 
 
 This section covers how to embed QuestRoomScan into a game that needs a one-time room scan followed by lightweight rendering.
 
+### Quick Start with RoomScanSession
+
+The simplest integration uses `RoomScanSession` — a high-level facade that wraps the full scan → refine → save → release flow into a few awaitable calls. Add it to the same GameObject as `RoomScanner`.
+
+```csharp
+var session = RoomScanSession.Instance;
+
+// First launch: scan the room
+session.StartScan();
+session.ProgressUpdated += p => progressBar.value = p.OverallProgress;
+
+// When the user is done scanning:
+ScanResult result = await session.FinalizeScanAsync();
+// result.Mesh     — simplified UV-mapped mesh, ready for MeshFilter
+// result.Atlas    — baked texture atlas, ready for material.mainTexture
+// result.PackageId — save this for future loads
+// GPU resources already released (~400-500 MB freed)
+
+// Subsequent launches: skip scanning entirely
+if (session.HasSavedScan)
+{
+    ScanResult result = await session.LoadLatestAsync();
+    // or: await session.LoadAsync(savedPackageId);
+    // Mesh + atlas ready in < 1 second
+}
+```
+
+`FinalizeScanAsync()` handles everything: stop scanning → texture refinement → save → release GPU resources.
+
 ### Lifecycle: Scan Phase → Game Phase
+
+For developers who want finer control, the underlying APIs are:
 
 ```
 1. Scan Phase:    StartScanning() → user looks around → StopScanning()
@@ -507,12 +539,11 @@ Set `TextureRefinement.postBakeSimplificationRatio` in the Inspector (e.g. 0.5 f
 ### Minimal Integration Checklist
 
 1. Add QuestRoomScan package to your project
-2. Run **RoomScan > Setup Scene** wizard (recommended with Game-Ready Preset)
-3. Disable `TriplanarCache` in inspector (save GPU memory) (Doesn't apply if Game-Ready preset used for setup)
-4. Set `postBakeSimplificationRatio` to 0.3–0.5 on `TextureRefinement` (Game-Ready Preset auto sets it to 0.5)
-5. Subscribe to `RefinedMeshReady` event
-6. After refinement: call `ReleaseScanResources()`, enter gameplay
-7. On subsequent launches: use `LoadRefinedOnlyAsync(pkgId)` to skip scanning
+2. Run **RoomScan > Setup Scene** wizard (Game-Ready Preset)
+3. Add `RoomScanSession` component to the RoomScanner GameObject
+4. Call `RoomScanSession.Instance.StartScan()` to begin
+5. Call `await RoomScanSession.Instance.FinalizeScanAsync()` when done — returns `ScanResult` with mesh + atlas
+6. On subsequent launches: `await RoomScanSession.Instance.LoadLatestAsync()`
 
 ## Credits & Prior Art
 

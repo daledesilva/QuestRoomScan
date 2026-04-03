@@ -1040,15 +1040,23 @@ namespace Genesis.RoomScan.Editor
 
         // -- Native Plugins -----------------------------------------------
 
-        bool _xatlasAndroid, _xatlasMacOS;
+        bool _xatlasAndroid, _xatlasEditor;
 
         void RefreshNativePlugins()
         {
             string pkgRoot = "Packages/com.genesis.roomscan/Runtime";
             _xatlasAndroid = System.IO.File.Exists(
                 Path.GetFullPath(Path.Combine(pkgRoot, "Plugins/Android/libxatlas.so")));
-            _xatlasMacOS = System.IO.File.Exists(
+#if UNITY_EDITOR_WIN
+            _xatlasEditor = System.IO.File.Exists(
+                Path.GetFullPath(Path.Combine(pkgRoot, "Plugins/Windows/xatlas.dll")));
+#elif UNITY_EDITOR_LINUX
+            _xatlasEditor = System.IO.File.Exists(
+                Path.GetFullPath(Path.Combine(pkgRoot, "Plugins/Linux/libxatlas.so")));
+#else
+            _xatlasEditor = System.IO.File.Exists(
                 Path.GetFullPath(Path.Combine(pkgRoot, "Plugins/macOS/libxatlas.bundle")));
+#endif
         }
 
         void DrawNativePlugins()
@@ -1056,9 +1064,15 @@ namespace Genesis.RoomScan.Editor
             RefreshNativePlugins();
             BeginSection("NATIVE PLUGINS");
             StatusRow("xatlas (Android ARM64)", _xatlasAndroid);
-            StatusRow("xatlas (macOS Editor)", _xatlasMacOS);
+#if UNITY_EDITOR_WIN
+            StatusRow("xatlas (Windows Editor)", _xatlasEditor);
+#elif UNITY_EDITOR_LINUX
+            StatusRow("xatlas (Linux Editor)", _xatlasEditor);
+#else
+            StatusRow("xatlas (macOS Editor)", _xatlasEditor);
+#endif
 
-            if (!_xatlasAndroid || !_xatlasMacOS)
+            if (!_xatlasAndroid || !_xatlasEditor)
             {
                 GUILayout.Space(2);
                 EditorGUILayout.BeginHorizontal();
@@ -1192,7 +1206,53 @@ namespace Genesis.RoomScan.Editor
 
             var builds = new System.Collections.Generic.List<(string label, string exe, string args, string outAssetPath)>();
 
-            // macOS
+            // Host editor plugin (platform-specific)
+#if UNITY_EDITOR_WIN
+            {
+                string clExe = FindMsvcCompiler();
+                if (clExe != null)
+                {
+                    string outDir = Path.Combine(pkgRoot, "Plugins/Windows");
+                    Directory.CreateDirectory(outDir);
+                    string outPath = Path.Combine(outDir, "xatlas.dll");
+                    string incFlags = hasMeshopt ? $" /I\"{meshoptDir}\"" : "";
+                    string allSrc = $"\"{srcApi}\" \"{srcImpl}\"" + (hasMeshopt ? $" \"{srcSimplifier}\"" : "");
+                    string bArgs = $"/nologo /O2 /std:c++14 /EHsc /LD{incFlags} {allSrc} /Fe:\"{outPath}\" /link /DLL";
+                    builds.Add(("Windows xatlas", clExe, bArgs,
+                        "Packages/com.genesis.roomscan/Runtime/Plugins/Windows/xatlas.dll"));
+                }
+                else
+                {
+                    string clangExe = FindHostClang();
+                    if (clangExe != null)
+                    {
+                        string outDir = Path.Combine(pkgRoot, "Plugins/Windows");
+                        Directory.CreateDirectory(outDir);
+                        string outPath = Path.Combine(outDir, "xatlas.dll");
+                        string bArgs = $"-shared -O2 -std=c++11{meshoptInc} " +
+                                       $"-o \"{outPath}\" \"{srcApi}\" \"{srcImpl}\"{meshoptSrc}";
+                        builds.Add(("Windows xatlas", clangExe, bArgs,
+                            "Packages/com.genesis.roomscan/Runtime/Plugins/Windows/xatlas.dll"));
+                    }
+                    else
+                    {
+                        Debug.LogError("[RoomScan Setup] No C++ compiler found. Install Visual Studio " +
+                            "with C++ Desktop workload, or add clang++/g++ to your PATH.");
+                    }
+                }
+            }
+#elif UNITY_EDITOR_LINUX
+            {
+                string outDir = Path.Combine(pkgRoot, "Plugins/Linux");
+                Directory.CreateDirectory(outDir);
+                string outPath = Path.Combine(outDir, "libxatlas.so");
+                string bArgs = $"-shared -O2 -fPIC -std=c++11 -fvisibility=hidden{meshoptInc} " +
+                               $"-o \"{outPath}\" \"{srcApi}\" \"{srcImpl}\"{meshoptSrc}";
+                string compiler = FindHostClang() ?? "g++";
+                builds.Add(("Linux xatlas", compiler, bArgs,
+                    "Packages/com.genesis.roomscan/Runtime/Plugins/Linux/libxatlas.so"));
+            }
+#else // macOS
             {
                 string outDir = Path.Combine(pkgRoot, "Plugins/macOS");
                 Directory.CreateDirectory(outDir);
@@ -1202,9 +1262,9 @@ namespace Genesis.RoomScan.Editor
                 builds.Add(("macOS xatlas", "clang++", bArgs,
                     "Packages/com.genesis.roomscan/Runtime/Plugins/macOS/libxatlas.bundle"));
             }
+#endif
 
-            // Android ARM64
-#if UNITY_EDITOR_OSX || UNITY_EDITOR_LINUX || UNITY_EDITOR_WIN
+            // Android ARM64 (cross-compile from any host)
             {
                 string ndkClang = FindNdkClang();
                 if (ndkClang != null)
@@ -1218,7 +1278,6 @@ namespace Genesis.RoomScan.Editor
                         "Packages/com.genesis.roomscan/Runtime/Plugins/Android/libxatlas.so"));
                 }
             }
-#endif
 
             if (builds.Count == 0)
             {
@@ -1254,9 +1313,90 @@ namespace Genesis.RoomScan.Editor
             string[] hosts = Directory.GetDirectories(prebuilt);
             if (hosts.Length == 0) return null;
 
-            string clangpp = Path.Combine(hosts[0], "bin/aarch64-linux-android31-clang++");
-            return System.IO.File.Exists(clangpp) ? clangpp : null;
+            string binDir = Path.Combine(hosts[0], "bin");
+            // Windows NDK ships .cmd wrappers; Unix has bare executables
+            string[] candidates = {
+                Path.Combine(binDir, "aarch64-linux-android31-clang++.cmd"),
+                Path.Combine(binDir, "aarch64-linux-android31-clang++.exe"),
+                Path.Combine(binDir, "aarch64-linux-android31-clang++"),
+            };
+            foreach (string c in candidates)
+                if (System.IO.File.Exists(c)) return c;
+
+            Debug.LogWarning($"[RoomScan Setup] NDK clang++ not found in {binDir}");
+            return null;
         }
+
+        static string FindHostClang()
+        {
+            // Check common locations for clang++ on the host
+            string[] candidates;
+#if UNITY_EDITOR_WIN
+            candidates = new[] { "clang++.exe", "clang++", "g++.exe" };
+#else
+            candidates = new[] { "clang++", "g++" };
+#endif
+            foreach (string name in candidates)
+            {
+                try
+                {
+                    var psi = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = name, Arguments = "--version",
+                        UseShellExecute = false, RedirectStandardOutput = true,
+                        RedirectStandardError = true, CreateNoWindow = true
+                    };
+                    using (var p = System.Diagnostics.Process.Start(psi))
+                    {
+                        p.WaitForExit(3000);
+                        if (p.ExitCode == 0) return name;
+                    }
+                }
+                catch { /* not found, try next */ }
+            }
+            return null;
+        }
+
+#if UNITY_EDITOR_WIN
+        static string FindMsvcCompiler()
+        {
+            // Use vswhere to locate MSVC cl.exe
+            string vswhere = Path.Combine(
+                System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFilesX86),
+                "Microsoft Visual Studio/Installer/vswhere.exe");
+            if (!System.IO.File.Exists(vswhere)) return null;
+
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = vswhere,
+                    Arguments = "-latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 " +
+                                "-property installationPath",
+                    UseShellExecute = false, RedirectStandardOutput = true,
+                    CreateNoWindow = true
+                };
+                using (var p = System.Diagnostics.Process.Start(psi))
+                {
+                    string vsPath = p.StandardOutput.ReadToEnd().Trim();
+                    p.WaitForExit(5000);
+                    if (string.IsNullOrEmpty(vsPath)) return null;
+
+                    string vcToolsDir = Path.Combine(vsPath, "VC/Tools/MSVC");
+                    if (!Directory.Exists(vcToolsDir)) return null;
+
+                    var versions = Directory.GetDirectories(vcToolsDir);
+                    if (versions.Length == 0) return null;
+
+                    System.Array.Sort(versions);
+                    string latest = versions[versions.Length - 1];
+                    string cl = Path.Combine(latest, "bin/Hostx64/x64/cl.exe");
+                    return System.IO.File.Exists(cl) ? cl : null;
+                }
+            }
+            catch { return null; }
+        }
+#endif
 
         // Async build state
         static System.Collections.Generic.List<(string label, System.Diagnostics.Process proc, string outAssetPath,
@@ -1273,10 +1413,22 @@ namespace Genesis.RoomScan.Editor
             {
                 try
                 {
+                    string fileName = exe;
+                    string arguments = args;
+
+                    // .cmd/.bat files on Windows cannot be started directly with
+                    // UseShellExecute=false; route through cmd.exe instead.
+                    if (exe.EndsWith(".cmd", System.StringComparison.OrdinalIgnoreCase) ||
+                        exe.EndsWith(".bat", System.StringComparison.OrdinalIgnoreCase))
+                    {
+                        fileName = "cmd.exe";
+                        arguments = $"/c \"\"{exe}\" {args}\"";
+                    }
+
                     var psi = new System.Diagnostics.ProcessStartInfo
                     {
-                        FileName = exe,
-                        Arguments = args,
+                        FileName = fileName,
+                        Arguments = arguments,
                         UseShellExecute = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
@@ -1372,24 +1524,43 @@ namespace Genesis.RoomScan.Editor
             }
 
             bool isAndroid = assetPath.Contains("/Android/");
+            bool isWindows = assetPath.Contains("/Windows/");
+            bool isLinux = assetPath.Contains("/Linux/");
 
             importer.SetCompatibleWithAnyPlatform(false);
             importer.SetCompatibleWithEditor(!isAndroid);
             importer.SetCompatibleWithPlatform(BuildTarget.Android, isAndroid);
-            importer.SetCompatibleWithPlatform(BuildTarget.StandaloneOSX, !isAndroid);
 
+            string platformLabel;
             if (isAndroid)
-                importer.SetPlatformData(BuildTarget.Android, "CPU", "ARM64");
-
-            if (!isAndroid)
             {
+                importer.SetPlatformData(BuildTarget.Android, "CPU", "ARM64");
+                platformLabel = "Android ARM64";
+            }
+            else if (isWindows)
+            {
+                importer.SetCompatibleWithPlatform(BuildTarget.StandaloneWindows64, true);
+                importer.SetEditorData("CPU", "AnyCPU");
+                importer.SetEditorData("OS", "Windows");
+                platformLabel = "Windows Editor";
+            }
+            else if (isLinux)
+            {
+                importer.SetCompatibleWithPlatform(BuildTarget.StandaloneLinux64, true);
+                importer.SetEditorData("CPU", "AnyCPU");
+                importer.SetEditorData("OS", "Linux");
+                platformLabel = "Linux Editor";
+            }
+            else
+            {
+                importer.SetCompatibleWithPlatform(BuildTarget.StandaloneOSX, true);
                 importer.SetEditorData("CPU", "AnyCPU");
                 importer.SetEditorData("OS", "OSX");
+                platformLabel = "macOS Editor";
             }
 
             importer.SaveAndReimport();
-            Debug.Log($"[RoomScan Setup] Configured plugin importer: {assetPath}" +
-                      (isAndroid ? " (Android ARM64)" : " (macOS Editor)"));
+            Debug.Log($"[RoomScan Setup] Configured plugin importer: {assetPath} ({platformLabel})");
         }
 
         // -- Master Button ------------------------------------------------
@@ -1432,14 +1603,14 @@ namespace Genesis.RoomScan.Editor
             FixShaderWiring();
 
             RefreshNativePlugins();
-            if (!_xatlasAndroid || !_xatlasMacOS)
+            if (!_xatlasAndroid || !_xatlasEditor)
                 BuildXAtlasPlugin();
 
             MarkDirty();
             Refresh();
 
             Debug.Log("[RoomScan Setup] Scene setup complete." +
-                (!_xatlasAndroid || !_xatlasMacOS ? " (xatlas build running in background)" : ""));
+                (!_xatlasAndroid || !_xatlasEditor ? " (xatlas build running in background)" : ""));
         }
 
         // =================================================================

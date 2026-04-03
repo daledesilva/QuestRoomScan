@@ -162,9 +162,16 @@ namespace Genesis.RoomScan.Editor
         {
             string pkgRoot = Path.GetFullPath("Packages/com.genesis.roomscan/Runtime");
             string androidPlugin = Path.Combine(pkgRoot, "Plugins/Android/libxatlas.so");
-            string macPlugin = Path.Combine(pkgRoot, "Plugins/macOS/libxatlas.bundle");
+            bool hasAndroid = File.Exists(androidPlugin);
 
-            if (File.Exists(androidPlugin) && File.Exists(macPlugin))
+#if UNITY_EDITOR_WIN
+            string editorPlugin = Path.Combine(pkgRoot, "Plugins/Windows/xatlas.dll");
+#elif UNITY_EDITOR_LINUX
+            string editorPlugin = Path.Combine(pkgRoot, "Plugins/Linux/libxatlas.so");
+#else
+            string editorPlugin = Path.Combine(pkgRoot, "Plugins/macOS/libxatlas.bundle");
+#endif
+            if (hasAndroid && File.Exists(editorPlugin))
                 return;
 
             RoomScanSetupWizard.BuildXAtlasPlugin();

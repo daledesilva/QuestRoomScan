@@ -128,11 +128,25 @@ Both optional dependencies can be combined. The `Genesis.RoomScan.AIDetection` a
 ## Quick Start
 
 1. Create a new blank URP scene
-2. Add a **Camera Rig** and **Passthrough** from Meta's Building Blocks (`Menu > Meta > Building Blocks`). The Camera Rig provides `OVRCameraRig` and the Passthrough block enables the passthrough layer — both are required before running the wizard.
-3. Open the setup wizard: **RoomScan > Setup Scene**
-4. The wizard checks prerequisites (AR Session, AROcclusionManager), configures project settings (boundaryless manifest, cleartext HTTP for LAN server), and adds required core components. Use the **Game-Ready Preset** for lean game integration (PCA + TextureRefinement with 0.5 simplification ratio), and the **Debug Preset** for development tools (debug HUD, input handler, overlays, VR input infrastructure). Optional modules (TriplanarCache, GSplat, etc.) are added via the inspector's **Add Module** dropdown on the RoomScanner component
-5. Build and deploy to Quest 3
-6. The room mesh appears as you look around — surfaces solidify with repeated observations
+2. **Configure XR Plugin Management**: Go to **Project Settings > XR Plug-in Management > Android** tab and enable **OpenXR**. Then under **OpenXR > Features (Android)**, enable the **Meta XR feature group** — this is required for passthrough, depth, and spatial data
+3. Add a **Camera Rig** and **Passthrough** from Meta's Building Blocks (`Menu > Meta > Building Blocks`). The Camera Rig provides `OVRCameraRig` and the Passthrough block enables the passthrough layer — both are required before running the wizard
+4. Verify your **Main Camera** background is set to **Solid Color** with alpha = 0 (i.e., `(0, 0, 0, 0)`). A skybox or opaque background will block passthrough
+5. Open the setup wizard: **RoomScan > Setup Scene**
+6. The wizard checks prerequisites (AR Session, AROcclusionManager), configures project settings (boundaryless manifest, cleartext HTTP for LAN server), and adds required core components. Use the **Game-Ready Preset** for lean game integration (PCA + TextureRefinement with 0.5 simplification ratio), and the **Debug Preset** for development tools (debug HUD, input handler, overlays, VR input infrastructure). Optional modules (TriplanarCache, GSplat, etc.) are added via the inspector's **Add Module** dropdown on the RoomScanner component
+7. The wizard also compiles native xatlas plugins (required for texture refinement). On **macOS**, this uses the system `clang++`. On **Windows**, you need Visual Studio with the C++ Desktop workload (for the editor plugin) — the Android plugin uses Unity's bundled NDK and needs no extra install. If the build fails, you can retry from the **Build xatlas Plugin** button in the wizard's NATIVE PLUGINS section
+8. Build and deploy to Quest 3
+9. The room mesh appears as you look around — surfaces solidify with repeated observations
+
+### Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| Black screen / no passthrough | Meta XR feature group not enabled | Project Settings > XR Plug-in Management > Android > OpenXR > Features > enable Meta XR feature group |
+| Black screen / no passthrough | Camera background not transparent | Set Main Camera > Environment > Background to Solid Color `(0,0,0,0)` |
+| Controller ray visible but no UI | Debug menu not opened | Press **left thumbstick click** to toggle the debug menu |
+| Scanning stays at "Discovering" | Depth frames not arriving | Verify OpenXR + Meta XR feature group are enabled; check that `com.oculus.permission.USE_SCENE` is in the Android manifest |
+| Refine shows "--" / does nothing | xatlas native plugin not built | Open **RoomScan > Setup Scene** wizard and click **Build xatlas Plugin**. On Windows, requires Visual Studio C++ workload or clang++ on PATH |
+| xatlas build fails on Windows | macOS-only build (pre-v1.x) | Pull latest main — Windows/Linux support was added |
 
 ## Usage Flow
 

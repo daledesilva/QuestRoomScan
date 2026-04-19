@@ -21,9 +21,11 @@ namespace Genesis.RoomScan
     /// minimal API with awaitable operations and a single result type.
     /// <para>
     /// Attach this component alongside <see cref="RoomScanner"/> or access via
-    /// <see cref="Instance"/> after it initializes.
+    /// <see cref="Instance"/> after it initializes. The Setup Scene wizard's
+    /// "Apply Game-Ready Setup" preset adds it automatically.
     /// </para>
     /// </summary>
+    [RequireComponent(typeof(RoomScanner))]
     public class RoomScanSession : MonoBehaviour
     {
         public static RoomScanSession Instance { get; private set; }
@@ -41,6 +43,11 @@ namespace Genesis.RoomScan
             _persistence = GetComponent<RoomScanPersistence>();
         }
 
+        private void OnDestroy()
+        {
+            if (Instance == this) Instance = null;
+        }
+
         private void Update()
         {
             if (_scanner != null && _scanner.IsScanning)
@@ -52,6 +59,33 @@ namespace Genesis.RoomScan
         {
             if (_scanner == null) { Logger.Error("RoomScanSession: RoomScanner not found"); return; }
             _scanner.StartScanning();
+        }
+
+        /// <summary>
+        /// Paints the voxels currently visible in the camera frustum as
+        /// "frozen" — they stop receiving integration updates until the user
+        /// explicitly <see cref="UnfreezeInView"/>s them again. Use this as
+        /// the user sweeps the room: visible chunks they're satisfied with
+        /// get painted done, and the <see cref="ScanCoverage.FrozenFraction"/>
+        /// metric (which drives <see cref="ScanPhase.Complete"/>) grows.
+        /// Integration keeps running globally on un-painted regions.
+        /// </summary>
+        public void FreezeInView()
+        {
+            if (_scanner == null) { Logger.Error("RoomScanSession: RoomScanner not found"); return; }
+            _scanner.FreezeInView();
+        }
+
+        /// <summary>
+        /// Inverse of <see cref="FreezeInView"/>: unfreezes voxels in the
+        /// current camera frustum so depth integration can refine them again.
+        /// Useful when you painted too aggressively or part of the scan looks
+        /// bad and needs re-capturing.
+        /// </summary>
+        public void UnfreezeInView()
+        {
+            if (_scanner == null) { Logger.Error("RoomScanSession: RoomScanner not found"); return; }
+            _scanner.UnfreezeInView();
         }
 
         /// <summary>
@@ -138,10 +172,47 @@ namespace Genesis.RoomScan
         /// <summary>Returns true if at least one saved scan package exists on disk.</summary>
         public bool HasSavedScan => _persistence != null && _persistence.HasAnyPackage();
 
+        /// <summary>
+        /// Deletes every saved scan package on disk (mesh, atlas, keyframes,
+        /// triplanar, manifest) and erases each package's spatial anchor from
+        /// Horizon OS. Intended for game flows where there is exactly one
+        /// "current" scan and a rescan should obsolete everything that came
+        /// before — call this immediately before <see cref="StartScan"/> to
+        /// stop the on-device scan store from growing unbounded.
+        /// Safe to call when nothing is saved (returns immediately).
+        /// </summary>
+        public Task ClearAllScansAsync()
+        {
+            if (_persistence == null) return Task.CompletedTask;
+            return _persistence.ClearAllPackagesAsync();
+        }
+
         /// <summary>Whether a scan is currently in progress.</summary>
         public bool IsScanning => _scanner != null && _scanner.IsScanning;
 
         /// <summary>Releases heavy GPU resources. Called automatically by <see cref="FinalizeScanAsync"/>.</summary>
         public void ReleaseScanResources() => _scanner?.ReleaseScanResources();
+
+        // ─── Camera permission (HEADSET_CAMERA on Quest 3+) ──────────────
+        //
+        // PCA can technically wait for the user's permission decision in its
+        // own coroutine (see Meta.XR.PassthroughCameraAccess.OnEnable), but
+        // game code usually wants to surface a deterministic "asking for
+        // permission" UI state and only call StartScan() after the user has
+        // decided. These helpers expose that without making callers reach
+        // into UnityEngine.Android.Permission directly.
+
+        /// <summary>True when the Horizon OS HEADSET_CAMERA permission has
+        /// been granted. Always true outside Android device builds.</summary>
+        public bool HasCameraPermission => PassthroughCameraProvider.HasCameraPermission;
+
+        /// <summary>Asynchronously requests the HEADSET_CAMERA permission and
+        /// resolves once the user accepts, denies, or dismisses the system
+        /// dialog. Call this <b>before</b> <see cref="StartScan"/> to avoid
+        /// scanning in degraded depth-only mode while the dialog is up.
+        /// Resolves <c>true</c> immediately if permission is already granted,
+        /// or outside Android device builds.</summary>
+        public Task<bool> RequestCameraPermissionAsync()
+            => PassthroughCameraProvider.RequestCameraPermissionAsync();
     }
 }

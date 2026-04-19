@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Xml.Linq;
@@ -35,6 +36,7 @@ namespace Genesis.RoomScan.Editor
         DepthDebugOverlay _depthDebug;
         TriplanarCache _triplanarCache;
         RoomScanPersistence _persistence;
+        RoomScanSession _session;
         KeyframeCollector _keyframeCollector;
         DebugMenuController _debugMenu;
         RoomScanInputHandler _inputHandler;
@@ -114,6 +116,7 @@ namespace Genesis.RoomScan.Editor
             _depthDebug = FindAny<DepthDebugOverlay>();
             _triplanarCache = FindAny<TriplanarCache>();
             _persistence = FindAny<RoomScanPersistence>();
+            _session = FindAny<RoomScanSession>();
             _keyframeCollector = FindAny<KeyframeCollector>();
             _debugMenu = FindAny<DebugMenuController>();
             _inputHandler = FindAny<RoomScanInputHandler>();
@@ -146,8 +149,12 @@ namespace Genesis.RoomScan.Editor
                 "debugOverlayShader");
             RefreshGSplat();
             RefreshAIDetection();
+            RefreshVRProject();
 
-            _boundarylessManifest = ManifestHasBoundaryless();
+            RefreshURPState();
+
+            RefreshBuildingBlocksState();
+            _boundarylessManifest = ManifestHasAllQuestVREntries();
             _cleartextAllowed = ManifestHasCleartextTraffic();
             _insecureHttpAllowed = PlayerSettings.insecureHttpOption != InsecureHttpOption.NotAllowed;
         }
@@ -170,6 +177,11 @@ namespace Genesis.RoomScan.Editor
         partial void WireAIDetectionComponents();
         partial void SetupAIDetectionIfAvailable(GameObject root);
 
+        // Partial methods implemented in RoomScanSetupWizard.VRProject.cs.
+        // Always present (no #if guard) because OpenXR + Meta XR are core deps.
+        partial void RefreshVRProject();
+        partial void DrawVRProjectSection();
+
         // =================================================================
         //  GUI
         // =================================================================
@@ -180,9 +192,16 @@ namespace Genesis.RoomScan.Editor
             _scroll = EditorGUILayout.BeginScrollView(_scroll);
             GUILayout.Space(4);
 
+            // Game-Ready Preset is the promoted, common workflow for game
+            // developers — keep it at the top so it's the first thing seen.
+            // Everything below is for inspection / piecemeal fixes / opt-in
+            // modules / final "do absolutely everything" sweep.
+            DrawGameReadyPreset();
+
             DrawPrerequisites();
             DrawProjectSettings();
             DrawComponents();
+            DrawVRProjectSection();
             DrawShaderWiring();
             DrawNativePlugins();
 
@@ -209,9 +228,26 @@ namespace Genesis.RoomScan.Editor
         {
             BeginSection("PREREQUISITES");
 
+            string urpLabel = _urpAssetCached != null
+                ? $"URP pipeline asset wired ({_urpAssetCached.name})"
+                : "URP pipeline asset wired";
+            StatusRow(urpLabel, _urpConfigured);
             StatusRow("ARSession", _arSession != null);
             StatusRow("Camera Rig (OVRCameraRig / XROrigin)", _cameraRig != null);
             StatusRow("AROcclusionManager", _arOcclusion != null);
+
+            if (!_urpConfigured)
+            {
+                GUILayout.Space(2);
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+                if (GUILayout.Button("Setup URP (Quest defaults)", GUILayout.Width(220)))
+                {
+                    EnsureURPSetup();
+                    Refresh();
+                }
+                EditorGUILayout.EndHorizontal();
+            }
 
             if (_arSession == null)
             {
@@ -273,7 +309,16 @@ namespace Genesis.RoomScan.Editor
 
             GameObject target = cam.gameObject;
 
-            // Need ARCameraManager as well for AROcclusionManager to work
+            // Need ARCameraManager as well for AROcclusionManager to work.
+            // Both throw a wall of "No active XRSubsystem" errors in Editor
+            // play mode without an active XR loader (no Quest, no Quest
+            // Link). On device they're fine. We previously tried to silence
+            // the Editor errors with EditorPlayModeXRGuard but the AR
+            // OnEnable order bug it relied on never reliably fired before
+            // the AR components' own OnEnable, and the workaround
+            // introduced its own NRE chain via AROcclusionManager.OnDisable
+            // → DestroyTextures. Reverted; just live with the Editor errors
+            // and build to device to actually test.
             if (target.GetComponent<ARCameraManager>() == null)
                 Undo.AddComponent<ARCameraManager>(target);
 
@@ -287,13 +332,45 @@ namespace Genesis.RoomScan.Editor
         // -- Project Settings ---------------------------------------------
 
         const string MANIFEST_PATH = "Assets/Plugins/Android/AndroidManifest.xml";
-        const string BOUNDARYLESS_FEATURE = "com.oculus.feature.BOUNDARYLESS_APP";
+
+        // Every <uses-feature> + <uses-permission> entry that QRS or its
+        // satellite modules expect at runtime. Some of these (HEADSET_CAMERA,
+        // USE_SCENE, USE_ANCHOR_API, etc.) are NOT in Meta's templated
+        // manifest set and get stripped any time OVRProjectSetup.FixAllAsync
+        // or the Project Setup Tool regenerates the manifest from
+        // OVRProjectConfig — hence this comprehensive ensure-pass that runs
+        // AFTER Meta's tooling in the wizard orchestrators.
+        //
+        // Each entry is idempotent (skip if already present, never remove).
+        struct ManifestFeature { public string Name; public bool Required; }
+        static readonly ManifestFeature[] REQUIRED_FEATURES = new[]
+        {
+            new ManifestFeature { Name = "android.hardware.vr.headtracking", Required = true  },
+            new ManifestFeature { Name = "oculus.software.handtracking",     Required = false },
+            new ManifestFeature { Name = "com.oculus.feature.PASSTHROUGH",   Required = false },
+            new ManifestFeature { Name = "com.oculus.feature.BOUNDARYLESS_APP", Required = true },
+        };
+
+        static readonly string[] REQUIRED_PERMISSIONS = new[]
+        {
+            "com.oculus.permission.HAND_TRACKING",
+            "com.oculus.permission.USE_ANCHOR_API",
+            "com.oculus.permission.USE_SCENE",
+            "horizonos.permission.HEADSET_CAMERA",
+        };
+
+        // horizonos SDK declaration — anchored to a current floor so MR
+        // features (camera, anchors) are exposed.
+        const string HORIZONOS_NS = "http://schemas.horizonos/sdk";
+        const string HORIZONOS_MIN_SDK_VERSION = "60";
+        const string HORIZONOS_TARGET_SDK_VERSION = "85";
 
         void DrawProjectSettings()
         {
             BeginSection("PROJECT SETTINGS");
 
-            StatusRow("AndroidManifest boundaryless entry", _boundarylessManifest);
+            StatusRow("AndroidManifest Quest VR entries (features + permissions)",
+                      _boundarylessManifest);
             StatusRow("AndroidManifest cleartext HTTP (LAN)", _cleartextAllowed);
             StatusRow("Player Settings: Allow HTTP", _insecureHttpAllowed);
 
@@ -302,9 +379,9 @@ namespace Genesis.RoomScan.Editor
                 GUILayout.Space(2);
                 EditorGUILayout.BeginHorizontal();
                 GUILayout.FlexibleSpace();
-                if (GUILayout.Button("Add Boundaryless Manifest", GUILayout.Width(200)))
+                if (GUILayout.Button("Add Quest VR Manifest Entries", GUILayout.Width(220)))
                 {
-                    FixBoundarylessManifest();
+                    EnsureQuestVRManifest();
                     Refresh();
                 }
                 EditorGUILayout.EndHorizontal();
@@ -340,7 +417,13 @@ namespace Genesis.RoomScan.Editor
             EndSection();
         }
 
-        static bool ManifestHasBoundaryless()
+        /// <summary>
+        /// Returns true iff every entry in REQUIRED_FEATURES /
+        /// REQUIRED_PERMISSIONS plus the horizonos SDK declaration is
+        /// already present in the manifest. Used by the status row + by the
+        /// orchestrators to decide whether to re-run the ensure-pass.
+        /// </summary>
+        static bool ManifestHasAllQuestVREntries()
         {
             string fullPath = Path.Combine(Application.dataPath, "..", MANIFEST_PATH);
             if (!File.Exists(fullPath)) return false;
@@ -348,9 +431,28 @@ namespace Genesis.RoomScan.Editor
             try
             {
                 var doc = XDocument.Load(fullPath);
+                if (doc.Root == null) return false;
                 XNamespace android = "http://schemas.android.com/apk/res/android";
-                return doc.Root?.Elements("uses-feature")
-                    .Any(e => e.Attribute(android + "name")?.Value == BOUNDARYLESS_FEATURE) ?? false;
+                XNamespace horizonos = HORIZONOS_NS;
+
+                foreach (var f in REQUIRED_FEATURES)
+                {
+                    bool found = doc.Root.Elements("uses-feature")
+                        .Any(e => e.Attribute(android + "name")?.Value == f.Name);
+                    if (!found) return false;
+                }
+
+                foreach (var p in REQUIRED_PERMISSIONS)
+                {
+                    bool found = doc.Root.Elements("uses-permission")
+                        .Any(e => e.Attribute(android + "name")?.Value == p);
+                    if (!found) return false;
+                }
+
+                bool hasHorizonOsSdk = doc.Root.Elements(horizonos + "uses-horizonos-sdk").Any();
+                if (!hasHorizonOsSdk) return false;
+
+                return true;
             }
             catch
             {
@@ -358,7 +460,15 @@ namespace Genesis.RoomScan.Editor
             }
         }
 
-        static void FixBoundarylessManifest()
+        /// <summary>
+        /// Idempotent: adds every required uses-feature, uses-permission, and
+        /// the horizonos:uses-horizonos-sdk declaration if any are missing.
+        /// Never removes existing entries — safe to run after Meta's
+        /// OVRProjectSetup.FixAllAsync has rewritten the manifest from
+        /// OVRProjectConfig defaults (which strips MR-only permissions like
+        /// HEADSET_CAMERA / USE_SCENE that aren't in OVR's template).
+        /// </summary>
+        static void EnsureQuestVRManifest()
         {
             string fullPath = Path.Combine(Application.dataPath, "..", MANIFEST_PATH);
 
@@ -374,25 +484,84 @@ namespace Genesis.RoomScan.Editor
             try
             {
                 var doc = XDocument.Load(fullPath);
+                if (doc.Root == null)
+                {
+                    Debug.LogError("[RoomScan Setup] AndroidManifest.xml has no <manifest> root.");
+                    return;
+                }
+
                 XNamespace android = "http://schemas.android.com/apk/res/android";
+                XNamespace horizonos = HORIZONOS_NS;
+                bool dirty = false;
+                var added = new List<string>();
 
-                bool exists = doc.Root?.Elements("uses-feature")
-                    .Any(e => e.Attribute(android + "name")?.Value == BOUNDARYLESS_FEATURE) ?? false;
-                if (exists) return;
+                // Make sure xmlns:horizonos is declared on root so the SDK
+                // element below can use the prefix without serializing as
+                // xmlns="...". Unity templates usually include it but
+                // OVR-regenerated manifests may not.
+                if (doc.Root.Attribute(XNamespace.Xmlns + "horizonos") == null)
+                {
+                    doc.Root.Add(new XAttribute(XNamespace.Xmlns + "horizonos", HORIZONOS_NS));
+                    dirty = true;
+                }
 
-                var element = new XElement("uses-feature",
-                    new XAttribute(android + "name", BOUNDARYLESS_FEATURE),
-                    new XAttribute(android + "required", "true"));
+                // <uses-feature>
+                foreach (var f in REQUIRED_FEATURES)
+                {
+                    bool exists = doc.Root.Elements("uses-feature")
+                        .Any(e => e.Attribute(android + "name")?.Value == f.Name);
+                    if (exists) continue;
 
-                doc.Root?.Add(element);
+                    var el = new XElement("uses-feature",
+                        new XAttribute(android + "name", f.Name),
+                        new XAttribute(android + "required", f.Required ? "true" : "false"));
+
+                    // headtracking gets a version attr by Android convention.
+                    if (f.Name == "android.hardware.vr.headtracking")
+                        el.Add(new XAttribute(android + "version", "1"));
+
+                    doc.Root.Add(el);
+                    added.Add($"feature:{f.Name}");
+                    dirty = true;
+                }
+
+                // <uses-permission>
+                foreach (var p in REQUIRED_PERMISSIONS)
+                {
+                    bool exists = doc.Root.Elements("uses-permission")
+                        .Any(e => e.Attribute(android + "name")?.Value == p);
+                    if (exists) continue;
+
+                    doc.Root.Add(new XElement("uses-permission",
+                        new XAttribute(android + "name", p)));
+                    added.Add($"perm:{p}");
+                    dirty = true;
+                }
+
+                // <horizonos:uses-horizonos-sdk>
+                bool hasHorizonOsSdk = doc.Root.Elements(horizonos + "uses-horizonos-sdk").Any();
+                if (!hasHorizonOsSdk)
+                {
+                    doc.Root.Add(new XElement(horizonos + "uses-horizonos-sdk",
+                        new XAttribute(horizonos + "minSdkVersion",    HORIZONOS_MIN_SDK_VERSION),
+                        new XAttribute(horizonos + "targetSdkVersion", HORIZONOS_TARGET_SDK_VERSION)));
+                    added.Add("horizonos:uses-horizonos-sdk");
+                    dirty = true;
+                }
+
+                if (!dirty)
+                {
+                    return;
+                }
+
                 doc.Save(fullPath);
-
                 AssetDatabase.Refresh();
-                Debug.Log($"[RoomScan Setup] Added {BOUNDARYLESS_FEATURE} to AndroidManifest.xml");
+                Debug.Log($"[RoomScan Setup] AndroidManifest: added {added.Count} entr{(added.Count == 1 ? "y" : "ies")} \u2192 " +
+                          string.Join(", ", added));
             }
             catch (System.Exception ex)
             {
-                Debug.LogError($"[RoomScan Setup] Failed to update manifest: {ex.Message}");
+                Debug.LogError($"[RoomScan Setup] Failed to update manifest: {ex.Message}\n{ex.StackTrace}");
             }
         }
 
@@ -587,8 +756,8 @@ namespace Genesis.RoomScan.Editor
 
             EndSection();
 
-            // ── Game-Ready Preset ──
-            DrawGameReadyPreset();
+            // Game-Ready Preset is rendered at the very top of the wizard
+            // (see OnGUI) — it is the promoted workflow.
 
             // ── Debug Preset ──
             DrawDebugPreset();
@@ -640,7 +809,10 @@ namespace Genesis.RoomScan.Editor
             if (root.GetComponent<RoomScanner>() == null)
                 Undo.AddComponent<RoomScanner>(root);
 
-            // PassthroughCameraAccess isn't pulled in by RequireComponent
+            // PassthroughCameraAccess isn't pulled in by RequireComponent.
+            // It will spam "No active XRSubsystem" / NRE errors in Editor
+            // play mode without an XR loader; that's expected and can't be
+            // fixed from outside Meta's package — build to device to test.
             if (root.GetComponent<PassthroughCameraAccess>() == null)
                 Undo.AddComponent<PassthroughCameraAccess>(root);
             if (root.GetComponent<PassthroughCameraProvider>() == null)
@@ -652,6 +824,11 @@ namespace Genesis.RoomScan.Editor
                 Undo.AddComponent<TextureRefinement>(root);
             if (root.GetComponent<RoomUnderstanding>() == null)
                 Undo.AddComponent<RoomUnderstanding>(root);
+
+            // Public game-dev facade — see comment in AddGameReadyComponentsToRoot.
+            if (root.GetComponent<RoomScanSession>() == null)
+                Undo.AddComponent<RoomScanSession>(root);
+
             SetupGSplatIfAvailable(root);
             SetupAIDetectionIfAvailable(root);
 
@@ -708,20 +885,30 @@ namespace Genesis.RoomScan.Editor
         {
             BeginSection("GAME-READY PRESET");
             EditorGUILayout.HelpBox(
-                "Lightweight module set for game integration: scan \u2192 refine \u2192 release GPU \u2192 play. " +
-                "Skips TriplanarCache, Gaussian Splat, and debug tools to save GPU and keep the build lean.",
+                "One-click \"make this project actually buildable for Quest VR\":\n" +
+                "  \u2022 Switch active build profile to Meta Quest if needed (re-click after the reload)\n" +
+                "  \u2022 URP pipeline + renderer at Assets/Settings/ with Quest-friendly defaults (4x MSAA, no HDR, single shadow cascade)\n" +
+                "  \u2022 VR project prerequisites (XR Plug-in, OpenXR features, OVRProjectConfig \u2014 Outstanding tier)\n" +
+                "  \u2022 AndroidManifest: full Quest VR feature/permission set (HEADSET_CAMERA, USE_SCENE, USE_ANCHOR_API, BOUNDARYLESS, etc.) + cleartext HTTP + insecureHttpOption\n" +
+                "  \u2022 Meta XR Building Blocks: OVRCameraRig, Passthrough Underlay, PassthroughCameraAccess\n" +
+                "  \u2022 AR Session + AROcclusionManager on the camera rig\n" +
+                "  \u2022 Game-ready scene modules (scan \u2192 refine \u2192 release GPU \u2192 play)\n" +
+                "  \u2022 Shader wiring + xatlas native plugin build (background)\n" +
+                "Skips TriplanarCache, Gaussian Splat, and debug tools to keep the build lean.",
                 MessageType.Info);
 
+            // ── Scene-level state ──
             bool hasPCA = _pcaComponent != null;
             bool hasPCAProvider = _cameraProvider != null;
             bool hasRefinement = _textureRefinement != null;
-
             bool hasRoomUnderstanding = _roomScanner != null && _roomScanner.GetComponent<RoomUnderstanding>() != null;
 
             StatusRowOptional("PassthroughCameraAccess (camera RGB)", hasPCA);
             StatusRowOptional("PassthroughCameraProvider", hasPCAProvider);
             StatusRowOptional("TextureRefinement (atlas baking)", hasRefinement);
             StatusRowOptional("RoomUnderstanding (MRUK bridge)", hasRoomUnderstanding);
+            StatusRowOptional("RoomScanSession (game-dev async API: StartScan / FinalizeScanAsync / LoadLatestAsync)",
+                              _session != null);
 
             if (hasRefinement)
             {
@@ -734,6 +921,26 @@ namespace Genesis.RoomScan.Editor
                     StatusRowOptional($"Post-bake simplification ({val:P0})", configured);
                 }
             }
+
+            // ── Project-level state (also fixed by this preset) ──
+            GUILayout.Space(2);
+            EditorGUILayout.LabelField("Project prerequisites", EditorStyles.miniLabel);
+            bool buildTargetIsAndroid = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android;
+            bool activeProfileIsMetaQuest = IsActiveProfileMetaQuest();
+            string profileLabel = activeProfileIsMetaQuest
+                ? "Meta Quest"
+                : (buildTargetIsAndroid ? "Android (plain)" : EditorUserBuildSettings.activeBuildTarget.ToString());
+            StatusRowOptional($"Active build profile = Meta Quest (current: {profileLabel})", activeProfileIsMetaQuest);
+            StatusRowOptional("URP pipeline asset (Quest defaults)", _urpConfigured);
+            StatusRowOptional("Meta XR Building Blocks (Camera Rig + Passthrough + PCA)", _bbAllPresent);
+            StatusRowOptional("Passthrough scene config (OVRManager + transparent center camera + HEADSET_CAMERA on startup)",
+                              _ovrPassthroughReady);
+            StatusRowOptional("AR Session + AROcclusionManager", _arSession != null && _arOcclusion != null);
+            StatusRowOptional("AndroidManifest (Quest VR features + permissions + cleartext)",
+                              _boundarylessManifest && _cleartextAllowed);
+            StatusRowOptional("Player Settings: Allow HTTP", _insecureHttpAllowed);
+            StatusRowOptional($"VR Project Bootstrap ({_vrOutstanding.Count} outstanding)", _vrOutstanding.Count == 0);
+            StatusRowOptional("xatlas native plugins (Android + Editor)", _xatlasAndroid && _xatlasEditor);
 
             bool triplanarAttached = _triplanarCache != null;
             if (triplanarAttached)
@@ -752,15 +959,32 @@ namespace Genesis.RoomScan.Editor
                 EditorGUILayout.EndHorizontal();
             }
 
-            bool gameReadyMissing = !hasPCA || !hasPCAProvider || !hasRefinement || !hasRoomUnderstanding;
-            if (gameReadyMissing)
+            bool sceneMissing   = !hasPCA || !hasPCAProvider || !hasRefinement || !hasRoomUnderstanding
+                                  || _session == null;
+            bool projectMissing = !buildTargetIsAndroid
+                                  || !activeProfileIsMetaQuest
+                                  || !_urpConfigured
+                                  || !_bbAllPresent
+                                  || !_ovrPassthroughReady
+                                  || _arSession == null || _arOcclusion == null
+                                  || !_boundarylessManifest || !_cleartextAllowed || !_insecureHttpAllowed
+                                  || _vrOutstanding.Count > 0
+                                  || !_xatlasAndroid || !_xatlasEditor;
+
+            if (sceneMissing || projectMissing)
             {
                 GUILayout.Space(2);
                 EditorGUILayout.BeginHorizontal();
                 GUILayout.FlexibleSpace();
-                if (GUILayout.Button("Add Game-Ready Modules", GUILayout.Width(200)))
-                    FixGameReadyModules();
+                using (new EditorGUI.DisabledScope(_gameReadyFixInProgress))
+                {
+                    if (GUILayout.Button("Apply Game-Ready Setup", GUILayout.Width(220)))
+                        FixGameReadyModules();
+                }
                 EditorGUILayout.EndHorizontal();
+
+                if (_gameReadyFixInProgress)
+                    EditorGUILayout.HelpBox("Game-Ready setup in progress (VR bootstrap + Meta XR sweep)\u2026", MessageType.Info);
             }
 
             EndSection();
@@ -809,14 +1033,119 @@ namespace Genesis.RoomScan.Editor
             EndSection();
         }
 
-        void FixGameReadyModules()
+        // Tracks whether either the Game-Ready preset or Setup Everything is
+        // currently running, so the matching buttons can disable themselves and
+        // we never re-enter the async orchestrator while VRProjectBootstrap.FixAllAsync
+        // is still awaiting Meta's project setup tool.
+        bool _gameReadyFixInProgress;
+
+        async void FixGameReadyModules()
+        {
+            if (_gameReadyFixInProgress) return;
+            _gameReadyFixInProgress = true;
+
+            try
+            {
+                if (TrySwitchToAndroidBuildTarget("Game-Ready Setup")) return;
+
+                EditorUtility.DisplayProgressBar("Game-Ready Setup",
+                    "Auditing VR project settings\u2026", 0.05f);
+                VRProjectBootstrap.Audit();
+
+                // URP first — shaders fall back to magenta until the
+                // pipeline asset exists and is wired into GraphicsSettings,
+                // so any later step that touches a Material/Shader needs
+                // this in place.
+                EditorUtility.DisplayProgressBar("Game-Ready Setup",
+                    "Ensuring URP pipeline + Quest-friendly defaults\u2026", 0.10f);
+                EnsureURPSetup();
+
+                EditorUtility.DisplayProgressBar("Game-Ready Setup",
+                    "Fixing VR prerequisites (XR Plug-in, OpenXR, OVRProjectConfig\u2026)", 0.15f);
+                await VRProjectBootstrap.FixAllAsync(CheckSeverity.Outstanding);
+
+                // EnsureQuestVRManifest is unconditional (and idempotent) on
+                // purpose — it has to undo any permission stripping that
+                // OVRProjectSetup.FixAllAsync may have done a moment ago when
+                // it regenerated the manifest from OVRProjectConfig defaults.
+                // HEADSET_CAMERA / USE_SCENE / USE_ANCHOR_API are not in
+                // Meta's templated set and would otherwise vanish here.
+                EditorUtility.DisplayProgressBar("Game-Ready Setup",
+                    "Updating AndroidManifest + Player Settings\u2026", 0.50f);
+                EnsureQuestVRManifest();
+                if (!ManifestHasCleartextTraffic()) FixCleartextTraffic();
+                if (PlayerSettings.insecureHttpOption == InsecureHttpOption.NotAllowed)
+                {
+                    PlayerSettings.insecureHttpOption = InsecureHttpOption.AlwaysAllowed;
+                    Debug.Log("[RoomScan Setup] Set Player Settings > insecureHttpOption to AlwaysAllowed");
+                }
+
+                // Meta XR Building Blocks: drops in OVRCameraRig +
+                // Passthrough Underlay + PassthroughCameraAccess with
+                // Meta's recommended wiring (TrackingOrigin = FloorLevel,
+                // Underlay layer set up, etc.). Done before AR session
+                // so AROcclusionManager can latch onto the new rig camera.
+                EditorUtility.DisplayProgressBar("Game-Ready Setup",
+                    "Installing Meta XR Building Blocks (Camera Rig + Passthrough)\u2026", 0.60f);
+                await EnsureRequiredBuildingBlocksAsync();
+                Refresh();
+
+                EditorUtility.DisplayProgressBar("Game-Ready Setup",
+                    "Setting up AR session + occlusion\u2026", 0.65f);
+                if (_arSession == null) FixARSession();
+                if (_cameraRig != null && _arOcclusion == null) FixAROcclusion();
+
+                EditorUtility.DisplayProgressBar("Game-Ready Setup",
+                    "Adding game-ready scene components\u2026", 0.80f);
+                AddGameReadyComponentsToRoot();
+
+                EditorUtility.DisplayProgressBar("Game-Ready Setup",
+                    "Wiring shaders\u2026", 0.90f);
+                FixShaderWiring();
+
+                RefreshNativePlugins();
+                bool xatlasMissing = !_xatlasAndroid || !_xatlasEditor;
+                if (xatlasMissing)
+                {
+                    EditorUtility.DisplayProgressBar("Game-Ready Setup",
+                        "Starting xatlas plugin build (background)\u2026", 0.97f);
+                    BuildXAtlasPlugin();
+                }
+
+                Debug.Log("[RoomScan Setup] Game-Ready setup complete." +
+                    (xatlasMissing ? " (xatlas build running in background)" : ""));
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogError($"[RoomScan Setup] Game-Ready setup failed: {ex}");
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+                _gameReadyFixInProgress = false;
+                MarkDirty();
+                Refresh();
+                Repaint();
+            }
+        }
+
+        // Pure scene-component piece of the game-ready preset, callable
+        // synchronously from the orchestrator above without owning Refresh().
+        void AddGameReadyComponentsToRoot()
         {
             var root = FindOrCreateRoot();
 
             if (root.GetComponent<RoomScanner>() == null)
                 Undo.AddComponent<RoomScanner>(root);
 
-            if (root.GetComponent<PassthroughCameraAccess>() == null)
+            // PassthroughCameraAccess is normally added by the Meta XR
+            // Building Block (see EnsureRequiredBuildingBlocksAsync), but
+            // fall back to a root-level component if the block didn't land
+            // anywhere in the scene — RoomScanner needs a PCA somewhere.
+            // PCA + ARSession + AROcclusionManager will spam errors in
+            // Editor play mode without an XR loader; that's expected,
+            // build to device.
+            if (UnityEngine.Object.FindAnyObjectByType<PassthroughCameraAccess>() == null)
                 Undo.AddComponent<PassthroughCameraAccess>(root);
             if (root.GetComponent<PassthroughCameraProvider>() == null)
                 Undo.AddComponent<PassthroughCameraProvider>(root);
@@ -825,6 +1154,13 @@ namespace Genesis.RoomScan.Editor
                 Undo.AddComponent<TextureRefinement>(root);
             if (root.GetComponent<RoomUnderstanding>() == null)
                 Undo.AddComponent<RoomUnderstanding>(root);
+
+            // RoomScanSession: public game-dev facade (StartScan / FinalizeScanAsync /
+            // LoadLatestAsync / HasSavedScan / ProgressUpdated). Without it,
+            // game code that follows the documented public-API path cannot
+            // find RoomScanSession.Instance and bails.
+            if (root.GetComponent<RoomScanSession>() == null)
+                Undo.AddComponent<RoomScanSession>(root);
 
             var tr = root.GetComponent<TextureRefinement>();
             if (tr != null)
@@ -842,9 +1178,54 @@ namespace Genesis.RoomScan.Editor
 
             foreach (var c in root.GetComponents<Component>())
                 WireComponent(c);
+        }
 
-            MarkDirty();
-            Refresh();
+        /// <summary>
+        /// If the active build target is not Android, switches it (which
+        /// triggers a domain reload and aborts the current async pipeline)
+        /// and returns true so the caller bails out cleanly. The user is
+        /// informed via dialog that they need to re-click after the reload.
+        /// </summary>
+        bool TrySwitchToAndroidBuildTarget(string flowName)
+        {
+            // Already on the Meta Quest profile? Nothing to do.
+            if (EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android
+                && IsActiveProfileMetaQuest())
+                return false;
+
+            EditorUtility.ClearProgressBar();
+
+            // Try the Meta Quest *build profile* first (Unity 6.1+). It's a
+            // derived Android profile that ships Quest-tuned Player + Quality
+            // overrides (Vulkan, IL2CPP, ARM64, Multiview, Quest quality
+            // level), and it's what the user picks by hand in File > Build
+            // Profiles. Falls back to plain Android if Meta Quest isn't
+            // registered (older Unity, missing Android module, etc.).
+            string what = "Meta Quest build profile";
+            EditorUtility.DisplayDialog(flowName,
+                "Active build target is " + EditorUserBuildSettings.activeBuildTarget +
+                (IsActiveProfileMetaQuest() ? " (Meta Quest profile)" : "") + ".\n\n" +
+                "Switching to the " + what + " now \u2014 this triggers a domain reload " +
+                "and aborts the rest of this run.\n\n" +
+                "Click \"" + flowName + "\" again after Unity finishes reloading to " +
+                "apply the remaining fixes.",
+                "Switch and reload");
+
+            if (!TryActivateMetaQuestProfile())
+            {
+                Debug.LogWarning("[RoomScan Setup] Meta Quest classic build profile not " +
+                                 "found \u2014 falling back to plain Android target. " +
+                                 "Run File > Build Profiles once to let Unity register the " +
+                                 "Meta Quest platform, then re-run this wizard.");
+                EditorUserBuildSettings.SwitchActiveBuildTarget(
+                    BuildTargetGroup.Android, BuildTarget.Android);
+            }
+
+            // Drop the in-progress flag — the domain reload will wipe state
+            // anyway, but if for some reason it doesn't fire we don't want
+            // to leave the wizard locked out forever.
+            _gameReadyFixInProgress = false;
+            return true;
         }
 
         void FixDebugModules()
@@ -1574,43 +1955,89 @@ namespace Genesis.RoomScan.Editor
                 fixedHeight = 36
             };
 
-            if (GUILayout.Button("\u2261  Setup Everything", style))
-                SetupEverything();
+            using (new EditorGUI.DisabledScope(_gameReadyFixInProgress))
+            {
+                if (GUILayout.Button("\u2261  Setup Everything", style))
+                    SetupEverything();
+            }
         }
 
-        void SetupEverything()
+        async void SetupEverything()
         {
-            if (_cameraRig == null)
+            if (_gameReadyFixInProgress) return;
+
+            _gameReadyFixInProgress = true;
+            try
             {
-                EditorUtility.DisplayDialog("Room Scan Setup",
-                    "No Camera Rig found in the scene.\n\n" +
-                    "Add a Camera Rig via Meta > Tools > Building Blocks first, " +
-                    "then run this wizard again.",
-                    "OK");
-                return;
-            }
+                if (TrySwitchToAndroidBuildTarget("Setup Everything")) return;
 
-            if (_arSession == null) FixARSession();
-            if (_arOcclusion == null) FixAROcclusion();
-            if (!_boundarylessManifest) FixBoundarylessManifest();
-            if (!_cleartextAllowed) FixCleartextTraffic();
-            if (!_insecureHttpAllowed)
+                EditorUtility.DisplayProgressBar("Setup Everything",
+                    "Fixing VR prerequisites (Outstanding + Recommended)\u2026", 0.05f);
+                VRProjectBootstrap.Audit();
+
+                // URP must exist before anything else so shaders resolve.
+                EditorUtility.DisplayProgressBar("Setup Everything",
+                    "Ensuring URP pipeline + Quest-friendly defaults\u2026", 0.10f);
+                EnsureURPSetup();
+
+                await VRProjectBootstrap.FixAllAsync(CheckSeverity.Recommended);
+
+                // Camera Rig + Passthrough via Meta XR Building Blocks
+                // — does the right thing whether or not a rig is already
+                // present. Done before AR session so AROcclusionManager
+                // can attach to the rig camera.
+                EditorUtility.DisplayProgressBar("Setup Everything",
+                    "Installing Meta XR Building Blocks (Camera Rig + Passthrough)\u2026", 0.30f);
+                await EnsureRequiredBuildingBlocksAsync();
+                Refresh();
+
+                EditorUtility.DisplayProgressBar("Setup Everything",
+                    "Setting up AR session + occlusion\u2026", 0.35f);
+                if (_arSession == null) FixARSession();
+                if (_arOcclusion == null) FixAROcclusion();
+
+                // See the matching comment in FixGameReadyModules — run
+                // unconditionally so this restores anything OVRProjectSetup
+                // stripped during the Recommended VR fix pass above.
+                EditorUtility.DisplayProgressBar("Setup Everything",
+                    "Updating AndroidManifest + Player Settings\u2026", 0.50f);
+                EnsureQuestVRManifest();
+                if (!_cleartextAllowed) FixCleartextTraffic();
+                if (!_insecureHttpAllowed)
+                {
+                    PlayerSettings.insecureHttpOption = InsecureHttpOption.AlwaysAllowed;
+                    Debug.Log("[RoomScan Setup] Set Player Settings > insecureHttpOption to AlwaysAllowed");
+                }
+
+                EditorUtility.DisplayProgressBar("Setup Everything",
+                    "Adding all components + wiring shaders\u2026", 0.75f);
+                FixComponents();
+                FixShaderWiring();
+
+                RefreshNativePlugins();
+                bool xatlasMissing = !_xatlasAndroid || !_xatlasEditor;
+                if (xatlasMissing)
+                {
+                    EditorUtility.DisplayProgressBar("Setup Everything",
+                        "Starting xatlas plugin build (background)\u2026", 0.95f);
+                    BuildXAtlasPlugin();
+                }
+
+                Debug.Log("[RoomScan Setup] Scene setup complete." +
+                    (xatlasMissing ? " (xatlas build running in background)" : ""));
+            }
+            catch (System.Exception ex)
             {
-                PlayerSettings.insecureHttpOption = InsecureHttpOption.AlwaysAllowed;
-                Debug.Log("[RoomScan Setup] Set Player Settings > insecureHttpOption to AlwaysAllowed");
+                Debug.LogError($"[RoomScan Setup] Setup Everything failed: {ex}");
             }
-            FixComponents();
-            FixShaderWiring();
-
-            RefreshNativePlugins();
-            if (!_xatlasAndroid || !_xatlasEditor)
-                BuildXAtlasPlugin();
-
-            MarkDirty();
-            Refresh();
-
-            Debug.Log("[RoomScan Setup] Scene setup complete." +
-                (!_xatlasAndroid || !_xatlasEditor ? " (xatlas build running in background)" : ""));
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+                _gameReadyFixInProgress = false;
+                MarkDirty();
+                Refresh();
+                Repaint();
+            }
         }
 
         // =================================================================

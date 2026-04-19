@@ -314,6 +314,17 @@ namespace Genesis.RoomScan
 
         private void Start()
         {
+            // Match DepthCapture's Editor early-out: when no XR loader is
+            // active, AR/MRUK subsystems are dead and any module that touches
+            // them on init will NRE. The user can still load saved scans
+            // through other code paths but cannot start a live scan.
+            if (!XRRuntimeGuard.IsXRActive)
+            {
+                Logger.Warning("RoomScanner: " + XRRuntimeGuard.EditorDisabledMessage);
+                enabled = false;
+                return;
+            }
+
             _modules = GetComponents<IRoomScanModule>();
             foreach (var m in _modules) m.OnModuleInitialize(this);
 
@@ -466,6 +477,40 @@ namespace Genesis.RoomScan
                 _stableColorCycles = 0;
                 _prevColorCoverage = 0f;
                 _stabilizedTime = 0f;
+
+                // Invalidate any previously loaded / refined output. Without
+                // this, a Begin() that follows a LoadRefinedOnlyAsync (or a
+                // prior in-session refinement) leaves HasRefinedTexture=true
+                // and the old _refinedMesh visible, which (a) keeps the stale
+                // mesh on screen instead of switching to live vertex preview
+                // and (b) makes RoomScanSession.FinalizeScanAsync skip the
+                // "if (!HasRefinedTexture) StartTextureRefinement()" gate, so
+                // the new TSDF gets saved but no fresh refined_mesh.bin is
+                // ever written. This is the same per-state-reset that
+                // ClearAllDataAsync does, just narrowed to the things a fresh
+                // scan must invalidate (volumes are already re-alloc'd above).
+                HasRefinedTexture = false;
+                HasHQRefinedTexture = false;
+                HasEnhancedMesh = false;
+                LastRefinedResult = null;
+                LastSimplifiedResult = null;
+                _cachedUnwrap = null;
+                _refinedMesh = null;
+                if (_normalMapTexture != null)
+                {
+                    Destroy(_normalMapTexture);
+                    _normalMapTexture = null;
+                }
+                _gsplatProvider?.ClearSplat();
+                _gsplatProvider?.ResetSplatTransform();
+                _downloadedPlyData = null;
+
+                // Switch render mode off Refined/HQRefined/Splat back to the
+                // live in-progress preview. Done after the HasRefined* flags
+                // are cleared so IsModeAvailable() reports the new state
+                // correctly and the renderer toggles in ApplyRenderMode pick
+                // up Vertex as the right visible mode.
+                SetRenderMode(ScanRenderMode.Vertex);
 
                 if (_persistence != null) _persistence.ClearActivePackage();
                 if (_keyframeCollector != null)
@@ -882,15 +927,22 @@ namespace Genesis.RoomScan
 
                 ApplyRefinedAtlas(toRender);
                 HasRefinedTexture = true;
-                RefinedMeshReady?.Invoke(_refinedMesh, _refinedAtlasTexture);
                 SetRenderMode(ScanRenderMode.Refined);
 
+                // IMPORTANT: persist refined artifacts BEFORE firing RefinedMeshReady.
+                // RoomScanSession.FinalizeScanAsync wakes on this event and then calls
+                // SaveScanAsync → Directory.Move(_tmp → pkg_xxx). If the event fired first,
+                // SaveArtifactAsync would race against that Move (the captured pkgDir would
+                // point at _tmp while the directory was being renamed), and refined_mesh.bin
+                // would silently fail to land in the final package.
                 if (_persistence != null && _persistence.HasActivePackage)
                 {
                     await _persistence.SaveArtifactAsync(ArtifactType.Refined, null, original);
                     if (LastSimplifiedResult.HasValue)
                         await _persistence.SaveArtifactAsync(ArtifactType.SimplifiedMesh, null, LastSimplifiedResult);
                 }
+
+                RefinedMeshReady?.Invoke(_refinedMesh, _refinedAtlasTexture);
 
                 Logger.Info("On-device texture refinement complete");
             }

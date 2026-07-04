@@ -157,7 +157,7 @@ Shader "Genesis/ScanMeshVertexColor"
                 if (_RSTriAvailable > 0.5)
                 {
                     half3 tri = SampleTriplanar(IN.positionWS, normal);
-                    baseColor = tri.r >= 0 ? tri : half3(normal * 0.5 + 0.5);
+                    baseColor = tri.r >= 0 ? tri : IN.color.rgb;
                 }
                 else if (_RSNormalFallback > 0.5)
                 {

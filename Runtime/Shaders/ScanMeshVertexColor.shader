@@ -57,6 +57,7 @@ Shader "Genesis/ScanMeshVertexColor"
             float _RSNormalFallback;
             float _RSWireframe;
             float _RSWireThickness;
+            float _RSHiddenFromMainView;
 
             // Live TSDF extraction can drift slightly from the depth texel that
             // wrote the triplanar cache. Keep rejection loose enough for preview.
@@ -149,6 +150,8 @@ Shader "Genesis/ScanMeshVertexColor"
             half4 frag(Varyings IN) : SV_Target
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(IN);
+                if (_RSHiddenFromMainView > 0.5)
+                    discard;
 
                 float3 normal = normalize(IN.normalWS);
                 bool showUntexturedWireframe = false;
@@ -232,6 +235,7 @@ Shader "Genesis/ScanMeshVertexColor"
             };
             StructuredBuffer<GPUVertex> _SurfaceVerts;
             StructuredBuffer<uint>      _SurfaceIndices;
+            float _RSHiddenFromMainView;
 
             struct Varyings
             {
@@ -251,6 +255,9 @@ Shader "Genesis/ScanMeshVertexColor"
             half4 frag(Varyings IN) : SV_Target
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(IN);
+                if (_RSHiddenFromMainView > 0.5)
+                    discard;
+
                 return 0;
             }
             ENDHLSL
@@ -277,6 +284,7 @@ Shader "Genesis/ScanMeshVertexColor"
             };
             StructuredBuffer<GPUVertex> _SurfaceVerts;
             StructuredBuffer<uint>      _SurfaceIndices;
+            float _RSHiddenFromMainView;
 
             struct Varyings
             {
@@ -299,6 +307,9 @@ Shader "Genesis/ScanMeshVertexColor"
             half4 frag(Varyings IN) : SV_Target
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(IN);
+                if (_RSHiddenFromMainView > 0.5)
+                    discard;
+
                 float3 n = normalize(IN.normalWS);
                 return half4(n * 0.5 + 0.5, 1);
             }

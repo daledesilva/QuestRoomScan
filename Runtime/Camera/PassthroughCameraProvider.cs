@@ -132,7 +132,7 @@ namespace Genesis.RoomScan
             // self-disables and from then on neither one plays.
             if (_pca == null)
             {
-                _pca = FindAnyObjectByType<PassthroughCameraAccess>(FindObjectsInactive.Include);
+                _pca = FindPreferredPassthroughCameraAccess();
                 if (_pca == null)
                 {
                     Logger.Warning("PassthroughCameraProvider: no PassthroughCameraAccess in scene — adding one to " +
@@ -154,6 +154,33 @@ namespace Genesis.RoomScan
             _pca.RequestedResolution = requestedResolution;
             _pca.MaxFramerate = maxFramerate;
             _pca.enabled = true;
+        }
+
+        private static PassthroughCameraAccess FindPreferredPassthroughCameraAccess()
+        {
+            var components = FindObjectsByType<PassthroughCameraAccess>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None);
+
+            PassthroughCameraAccess firstActive = null;
+            PassthroughCameraAccess firstAny = null;
+
+            foreach (var component in components)
+            {
+                if (component == null) continue;
+                firstAny ??= component;
+
+                bool isActive = component.enabled && component.gameObject.activeInHierarchy;
+                if (!isActive) continue;
+
+                if (firstActive == null)
+                    firstActive = component;
+
+                if (component.gameObject.name.IndexOf("Passthrough Camera Access", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return component;
+            }
+
+            return firstActive != null ? firstActive : firstAny;
         }
 
         /// <inheritdoc />

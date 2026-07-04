@@ -58,7 +58,9 @@ Shader "Genesis/ScanMeshVertexColor"
             float _RSWireframe;
             float _RSWireThickness;
 
-            #define DEPTH_TOLERANCE 0.015
+            // Live TSDF extraction can drift slightly from the depth texel that
+            // wrote the triplanar cache. Keep rejection loose enough for preview.
+            #define DEPTH_TOLERANCE 0.08
 
             float3 WorldToVoxelUVW(float3 worldPos)
             {
@@ -155,7 +157,7 @@ Shader "Genesis/ScanMeshVertexColor"
                 if (_RSTriAvailable > 0.5)
                 {
                     half3 tri = SampleTriplanar(IN.positionWS, normal);
-                    baseColor = tri.r >= 0 ? tri : IN.color.rgb;
+                    baseColor = tri.r >= 0 ? tri : half3(normal * 0.5 + 0.5);
                 }
                 else if (_RSNormalFallback > 0.5)
                 {

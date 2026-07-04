@@ -151,13 +151,24 @@ Shader "Genesis/ScanMeshVertexColor"
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(IN);
 
                 float3 normal = normalize(IN.normalWS);
+                bool showUntexturedWireframe = false;
 
                 // 1. Compute base color
                 half3 baseColor;
                 if (_RSTriAvailable > 0.5)
                 {
                     half3 tri = SampleTriplanar(IN.positionWS, normal);
-                    baseColor = tri.r >= 0 ? tri : IN.color.rgb;
+                    if (tri.r >= 0)
+                    {
+                        baseColor = tri;
+                    }
+                    else
+                    {
+                        // Texture preview should reveal untextured scan edges as mesh,
+                        // not as a solid grey fill or as the separate gradient mode.
+                        baseColor = IN.color.rgb;
+                        showUntexturedWireframe = true;
+                    }
                 }
                 else if (_RSNormalFallback > 0.5)
                 {
@@ -172,7 +183,7 @@ Shader "Genesis/ScanMeshVertexColor"
                 baseColor = ApplyFreezeTint(baseColor, IN.positionWS);
 
                 // 3. Wireframe: discard interior, white edges blending to vertex color at vertices
-                if (_RSWireframe > 0.5)
+                if (_RSWireframe > 0.5 || showUntexturedWireframe)
                 {
                     float thickness = max(_RSWireThickness, 0.2);
                     float3 bary = IN.barycentric;

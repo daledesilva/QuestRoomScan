@@ -120,6 +120,13 @@ namespace Genesis.RoomScan
         /// <summary>Depth texture after jump-flood dilation, used by the integrator to fill holes near voxel boundaries.</summary>
         public RenderTexture DilatedDepthTex => _dilatedDepth;
 
+        /// <summary>Reduces depth filtering and dilation work per captured frame.</summary>
+        public void ApplyGameplayPerformancePreset()
+        {
+            dilationSteps = 4;
+            filterRadius = 1;
+        }
+
         private RenderTexture _simulatedDepthTex;
         private RenderTexture _filteredDepthTex;
         private int _dilationMaxStep;

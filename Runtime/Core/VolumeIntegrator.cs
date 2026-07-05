@@ -135,6 +135,19 @@ namespace Genesis.RoomScan
         public int IntegrationCount { get; private set; }
         public int WarmupIntegrations => warmupIntegrations;
 
+        /// <summary>
+        /// Coarsens the TSDF grid and throttles coverage metrics before GPU volumes allocate.
+        /// </summary>
+        public void ApplyGameplayPerformancePreset()
+        {
+            if (_volume != null) return;
+
+            voxelCount = new int3(192, 192, 192);
+            voxelSize = 0.07f;
+            coverageUpdateInterval = 45;
+            pruneIntervalSeconds = 5f;
+        }
+
         /// <summary>Raised after each integration compute dispatch (before pruning).</summary>
         public event Action Integrated;
         /// <summary>Raised after the volume is cleared.</summary>

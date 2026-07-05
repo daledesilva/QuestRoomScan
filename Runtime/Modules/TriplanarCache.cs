@@ -32,6 +32,16 @@ namespace Genesis.RoomScan
         /// <summary>Whether triplanar texturing is active (false = vertex-color fallback).</summary>
         public bool IsTriplanarEnabled => enableTriplanar;
 
+        /// <summary>
+        /// Lowers triplanar atlas resolution before GPU textures are created in <see cref="Start"/>.
+        /// </summary>
+        public void ApplyGameplayPerformancePreset()
+        {
+            if (_triXZ != null) return;
+
+            textureResolution = 2048;
+        }
+
         private RenderTexture _triXZ, _triXY, _triYZ;
         private RenderTexture _depthXZ, _depthXY, _depthYZ;
         private RenderTexture _camFrameCopy;

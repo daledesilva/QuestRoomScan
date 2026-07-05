@@ -370,6 +370,24 @@ namespace Genesis.RoomScan
         }
 
         /// <summary>
+        /// Lowers live-scan GPU/CPU cost for gameplay scenes that keep scanning during play.
+        /// Call before <see cref="StartScanningAsync"/> so volume and triplanar allocations pick up the preset.
+        /// </summary>
+        public void ApplyGameplayPerformancePreset()
+        {
+            integrationHz = 15f;
+            meshExtractionHz = 10f;
+
+            _volumeIntegrator?.ApplyGameplayPerformancePreset();
+            _meshExtractor?.ApplyGameplayPerformancePreset();
+            _cameraProvider?.ApplyGameplayPerformancePreset();
+            _triplanarCache?.ApplyGameplayPerformancePreset();
+            _depthCapture?.ApplyGameplayPerformancePreset();
+
+            Logger.Info("RoomScanner: applied gameplay performance preset");
+        }
+
+        /// <summary>
         /// Finishes startup after MRUK room is ready (or immediately if <see cref="RoomAnchorManager"/> is disabled).
         /// </summary>
         private void CompleteRoomStartup()

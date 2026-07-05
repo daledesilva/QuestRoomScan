@@ -64,6 +64,13 @@ namespace Genesis.RoomScan
                 ? new Vector2(_pca.CurrentResolution.x, _pca.CurrentResolution.y)
                 : new Vector2(1280, 960);
 
+        /// <summary>Lowers passthrough camera resolution and frame rate for live scan gameplay.</summary>
+        public void ApplyGameplayPerformancePreset()
+        {
+            requestedResolution = new Vector2Int(640, 480);
+            maxFramerate = 20;
+        }
+
         /// <summary>
         /// True when the user has granted the Horizon OS HEADSET_CAMERA
         /// permission. Always true outside Android device builds.

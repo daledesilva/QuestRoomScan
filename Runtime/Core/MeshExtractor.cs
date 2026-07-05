@@ -53,6 +53,17 @@ namespace Genesis.RoomScan
         /// <summary>Current GPU mesh index count (updated after each extraction via async readback).</summary>
         public int LastIndexCount { get; private set; }
 
+        /// <summary>
+        /// Reduces mesh extraction smoothing and vertex budget before Surface Nets buffers allocate.
+        /// </summary>
+        public void ApplyGameplayPerformancePreset()
+        {
+            if (_gpuSurfaceNets != null) return;
+
+            gpuVertexBudgetPercent = 0.05f;
+            meshSmoothIterations = 0;
+        }
+
         private VolumeIntegrator _volume;
 
         private void Awake()

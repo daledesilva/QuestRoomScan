@@ -9,12 +9,14 @@ namespace Genesis.RoomScan
     [DisallowMultipleComponent]
     public class RoomScanGameplayAutoFreeze : MonoBehaviour
     {
-        private const float MinFreezeIntervalSeconds = 2.5f;
+        private const float MinScanDurationBeforeAutoFreezeSeconds = 60f;
+        private const float MinFreezeIntervalSeconds = 10f;
         private const float StopAutoFreezeFrozenFraction = 0.85f;
 
         private RoomScanner _roomScanner;
         private RoomScanSession _roomScanSession;
         private float _lastAutoFreezeTime;
+        private float _scanStartTime;
 
         private void Awake()
         {
@@ -26,13 +28,16 @@ namespace Genesis.RoomScan
         {
             if (_roomScanner == null || !_roomScanner.IsScanning) return;
 
+            if (_scanStartTime <= 0f)
+                _scanStartTime = Time.time;
+            if (Time.time - _scanStartTime < MinScanDurationBeforeAutoFreezeSeconds) return;
+
             ScanProgress progress = _roomScanner.CurrentProgress;
             if (progress.Coverage.FrozenFraction >= StopAutoFreezeFrozenFraction) return;
-            if (progress.Phase < ScanPhase.Refining) return;
+            if (progress.Phase < ScanPhase.Stabilized) return;
             if (Time.time - _lastAutoFreezeTime < MinFreezeIntervalSeconds) return;
 
-            bool shouldFreeze = progress.Coverage.IsStabilized || progress.Phase >= ScanPhase.Stabilized;
-            if (!shouldFreeze) return;
+            if (!progress.Coverage.IsStabilized && progress.Phase < ScanPhase.Complete) return;
 
             if (_roomScanSession != null)
                 _roomScanSession.FreezeInView();

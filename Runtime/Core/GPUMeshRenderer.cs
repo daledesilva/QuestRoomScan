@@ -7,7 +7,7 @@ namespace Genesis.RoomScan
     /// Renders the GPU Surface Nets mesh via Graphics.RenderPrimitivesIndirect.
     /// Replaces per-chunk MeshFilter+MeshRenderer with a single indirect draw call.
     /// </summary>
-    internal class GPUMeshRenderer : MonoBehaviour
+    public class GPUMeshRenderer : MonoBehaviour
     {
         [SerializeField] private Material gpuMeshMaterial;
 
@@ -51,15 +51,24 @@ namespace Genesis.RoomScan
 
         private void LateUpdate()
         {
+            TryRenderIndirect();
+        }
+
+        /// <summary>
+        /// Draws the GPU Surface Nets mesh when buffers and material are ready.
+        /// Caller should set <see cref="RenderTexture.active"/> before calling when targeting an offscreen buffer.
+        /// </summary>
+        public bool TryRenderIndirect()
+        {
             if (!_ready || !_renderVisible || _surfaceNets == null || gpuMeshMaterial == null)
-                return;
+                return false;
 
             var vertBuf = _surfaceNets.VertexBuffer;
             var idxBuf = _surfaceNets.IndexBuffer;
             var argsBuf = _surfaceNets.DrawIndirectArgs;
 
             if (vertBuf == null || idxBuf == null || argsBuf == null)
-                return;
+                return false;
 
             _props.SetBuffer(ID_SurfaceVerts, vertBuf);
             _props.SetBuffer(ID_SurfaceIndices, idxBuf);
@@ -74,6 +83,7 @@ namespace Genesis.RoomScan
             };
 
             Graphics.RenderPrimitivesIndirect(rp, MeshTopology.Triangles, argsBuf, 1);
+            return true;
         }
 
         private void OnDisable()

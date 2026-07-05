@@ -375,8 +375,11 @@ namespace Genesis.RoomScan
         /// </summary>
         public void ApplyGameplayPerformancePreset()
         {
+            _gameplayPerformancePresetEnabled = true;
             integrationHz = 15f;
             meshExtractionHz = 10f;
+
+            CacheComponents();
 
             _volumeIntegrator?.ApplyGameplayPerformancePreset();
             _meshExtractor?.ApplyGameplayPerformancePreset();
@@ -386,6 +389,8 @@ namespace Genesis.RoomScan
 
             Logger.Info("RoomScanner: applied gameplay performance preset");
         }
+
+        private bool _gameplayPerformancePresetEnabled;
 
         /// <summary>
         /// Finishes startup after MRUK room is ready (or immediately if <see cref="RoomAnchorManager"/> is disabled).
@@ -499,6 +504,10 @@ namespace Genesis.RoomScan
         public async Task StartScanningAsync()
         {
             if (IsScanning) return;
+
+            if (_gameplayPerformancePresetEnabled)
+                ApplyGameplayPerformancePreset();
+
             IsScanning = true;
             try
             {

@@ -69,6 +69,50 @@ namespace Genesis.RoomScan
         {
             requestedResolution = new Vector2Int(640, 480);
             maxFramerate = 20;
+            ApplyPassthroughCameraAccessSettings();
+        }
+
+        private void ApplyPassthroughCameraAccessSettings()
+        {
+            if (_pca == null)
+                _pca = FindPreferredPassthroughCameraAccess();
+            if (_pca == null) return;
+
+            // PCA forbids MaxFramerate changes while running. Drive it disabled
+            // for the property writes, then re-enable so OnEnable runs cleanly.
+            bool wasEnabled = _pca.enabled;
+            if (wasEnabled) _pca.enabled = false;
+            _pca.CameraPosition = cameraPosition;
+            _pca.RequestedResolution = requestedResolution;
+            _pca.MaxFramerate = maxFramerate;
+            _pca.enabled = true;
+        }
+
+        private static PassthroughCameraAccess FindPreferredPassthroughCameraAccess()
+        {
+            var components = FindObjectsByType<PassthroughCameraAccess>(
+                FindObjectsInactive.Include,
+                FindObjectsSortMode.None);
+
+            PassthroughCameraAccess firstActive = null;
+            PassthroughCameraAccess firstAny = null;
+
+            foreach (var component in components)
+            {
+                if (component == null) continue;
+                firstAny ??= component;
+
+                bool isActive = component.enabled && component.gameObject.activeInHierarchy;
+                if (!isActive) continue;
+
+                if (firstActive == null)
+                    firstActive = component;
+
+                if (component.gameObject.name.IndexOf("Passthrough Camera Access", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return component;
+            }
+
+            return firstActive != null ? firstActive : firstAny;
         }
 
         /// <summary>
@@ -152,42 +196,7 @@ namespace Genesis.RoomScan
                 }
             }
 
-            // PCA forbids MaxFramerate changes while running. Drive it disabled
-            // for the property writes, then re-enable so OnEnable runs cleanly.
-            // No-op if it was already disabled.
-            bool wasEnabled = _pca.enabled;
-            if (wasEnabled) _pca.enabled = false;
-            _pca.CameraPosition = cameraPosition;
-            _pca.RequestedResolution = requestedResolution;
-            _pca.MaxFramerate = maxFramerate;
-            _pca.enabled = true;
-        }
-
-        private static PassthroughCameraAccess FindPreferredPassthroughCameraAccess()
-        {
-            var components = FindObjectsByType<PassthroughCameraAccess>(
-                FindObjectsInactive.Include,
-                FindObjectsSortMode.None);
-
-            PassthroughCameraAccess firstActive = null;
-            PassthroughCameraAccess firstAny = null;
-
-            foreach (var component in components)
-            {
-                if (component == null) continue;
-                firstAny ??= component;
-
-                bool isActive = component.enabled && component.gameObject.activeInHierarchy;
-                if (!isActive) continue;
-
-                if (firstActive == null)
-                    firstActive = component;
-
-                if (component.gameObject.name.IndexOf("Passthrough Camera Access", StringComparison.OrdinalIgnoreCase) >= 0)
-                    return component;
-            }
-
-            return firstActive != null ? firstActive : firstAny;
+            ApplyPassthroughCameraAccessSettings();
         }
 
         /// <inheritdoc />

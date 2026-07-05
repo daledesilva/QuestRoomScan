@@ -32,15 +32,37 @@ namespace Genesis.RoomScan
         /// <summary>Whether triplanar texturing is active (false = vertex-color fallback).</summary>
         public bool IsTriplanarEnabled => enableTriplanar;
 
+        /// <summary>Current triplanar atlas edge length in texels (each of the three planes).</summary>
+        public int TextureResolution => textureResolution;
+
         /// <summary>
         /// Lowers triplanar atlas resolution before GPU textures are created in <see cref="Start"/>.
+        /// Also throttles bake rate and downscales camera frames during gameplay scans.
         /// </summary>
         public void ApplyGameplayPerformancePreset()
         {
+            _gameplayPerformancePreset = true;
             if (_triXZ != null) return;
 
             textureResolution = 2048;
         }
+
+        /// <summary>
+        /// Scales triplanar atlas resolution before GPU textures allocate. Used by gameplay reflection tuning.
+        /// </summary>
+        public void ScaleTextureResolution(float scale)
+        {
+            if (_triXZ != null || scale <= 0f)
+                return;
+
+            textureResolution = Mathf.Clamp(Mathf.RoundToInt(textureResolution * scale), 512, 8192);
+        }
+
+        private bool _gameplayPerformancePreset;
+        private const float GameplayBakeMinIntervalSeconds = 0.25f;
+        private const int GameplayCamCopyWidth = 640;
+        private const int GameplayCamCopyHeight = 480;
+        private float _lastGameplayBakeTime = float.NegativeInfinity;
 
         private RenderTexture _triXZ, _triXY, _triYZ;
         private RenderTexture _depthXZ, _depthXY, _depthYZ;
@@ -374,7 +396,27 @@ namespace Genesis.RoomScan
                 return;
             }
 
-            EnsureCamCopy(camFrame.width, camFrame.height);
+            if (_gameplayPerformancePreset)
+            {
+                float bakeInterval = Time.time - _lastGameplayBakeTime;
+                if (bakeInterval < GameplayBakeMinIntervalSeconds) return;
+                _lastGameplayBakeTime = Time.time;
+            }
+
+            int camCopyWidth = camFrame.width;
+            int camCopyHeight = camFrame.height;
+            if (_gameplayPerformancePreset)
+            {
+                camCopyWidth = GameplayCamCopyWidth;
+                camCopyHeight = GameplayCamCopyHeight;
+                float scaleX = camCopyWidth / (float)camFrame.width;
+                float scaleY = camCopyHeight / (float)camFrame.height;
+                focalLen = new Vector2(focalLen.x * scaleX, focalLen.y * scaleY);
+                principalPt = new Vector2(principalPt.x * scaleX, principalPt.y * scaleY);
+                currentRes = new Vector2(camCopyWidth, camCopyHeight);
+            }
+
+            EnsureCamCopy(camCopyWidth, camCopyHeight);
             Graphics.Blit(camFrame, _camFrameCopy);
 
             bakeCompute.SetMatrixArray(DepthCapture.ViewID, dc.View);
@@ -430,7 +472,7 @@ namespace Genesis.RoomScan
             _bakeCount++;
             if (_bakeCount <= 3 || _bakeCount % 100 == 0)
                 Logger.Info($"TriBake #{_bakeCount}: depth={dc.DepthTex.width}x{dc.DepthTex.height}, " +
-                    $"cam={camFrame.width}x{camFrame.height}, triAvail=1");
+                    $"cam={camCopyWidth}x{camCopyHeight}, triAvail=1, gameplay={_gameplayPerformancePreset}");
         }
 
         private void EnsureCamCopy(int w, int h)

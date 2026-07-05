@@ -54,6 +54,8 @@ namespace Genesis.RoomScan
 
         /// <summary>3D RenderTexture (R8G8_SNorm) storing the truncated signed distance field.</summary>
         public RenderTexture Volume => _volume;
+        /// <summary>True when the TSDF volume texture has been allocated and shader globals are publishable.</summary>
+        public bool IsVolumeReady => _volume != null;
         /// <summary>3D RenderTexture (RGBA8_UNorm) storing per-voxel accumulated color.</summary>
         public RenderTexture ColorVolume => _colorVolume;
         public int3 VoxelCount => voxelCount;
@@ -146,6 +148,20 @@ namespace Genesis.RoomScan
             voxelSize = 0.07f;
             coverageUpdateInterval = 45;
             pruneIntervalSeconds = 5f;
+        }
+
+        /// <summary>
+        /// Scales voxel grid count per axis before GPU volumes allocate. Used by gameplay reflection tuning.
+        /// </summary>
+        public void ScaleVoxelGridResolution(float scale)
+        {
+            if (_volume != null || scale <= 0f)
+                return;
+
+            voxelCount = new int3(
+                Mathf.Max(32, Mathf.RoundToInt(voxelCount.x * scale)),
+                Mathf.Max(32, Mathf.RoundToInt(voxelCount.y * scale)),
+                Mathf.Max(32, Mathf.RoundToInt(voxelCount.z * scale)));
         }
 
         /// <summary>Raised after each integration compute dispatch (before pruning).</summary>

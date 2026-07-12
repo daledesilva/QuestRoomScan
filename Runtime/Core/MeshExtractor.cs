@@ -48,6 +48,11 @@ namespace Genesis.RoomScan
         internal GPUSurfaceNets GpuSurfaceNets => _gpuSurfaceNets;
         public bool IsInitialized => _gpuSurfaceNets != null;
 
+        // Env-map / gameplay callers need the AABB of actual surface verts, not the fixed TSDF volume cube.
+        private const int GpuVertexStrideBytes = 32;
+        private const int LiveBoundsMaxSamples = 8192;
+        private bool _liveBoundsReadbackInProgress;
+
         /// <summary>Current GPU mesh vertex count (updated after each extraction via async readback).</summary>
         public int LastVertexCount { get; private set; }
         /// <summary>Current GPU mesh index count (updated after each extraction via async readback).</summary>
@@ -152,6 +157,7 @@ namespace Genesis.RoomScan
 
             _gpuSurfaceNets.Extract(_volume.Volume, _volume.ColorVolume, _volume.VoxelSize);
 
+            // Keep volume AABB for frustum culling — live geometry can grow inside it.
             if (_gpuRenderer != null)
                 _gpuRenderer.UpdateBounds(_gpuSurfaceNets.GetVolumeBounds(_volume.VoxelSize));
 
@@ -169,6 +175,116 @@ namespace Genesis.RoomScan
                     }
                 });
             }
+        }
+
+        /// <summary>
+        /// Async AABB of current Surface Nets vertices (sparse sample). Use for env-map capture
+        /// origin as the scanned room grows — <see cref="GPUMeshRenderer.WorldBounds"/> stays
+        /// the fixed TSDF volume and does not track live geometry.
+        /// Always invokes <paramref name="onComplete"/> once with success=false on failure so
+        /// callers can clear pending flags.
+        /// </summary>
+        public void RequestLiveMeshWorldBounds(Action<bool, Bounds> onComplete, int maxSamples = LiveBoundsMaxSamples)
+        {
+            if (onComplete == null)
+                return;
+            // Caller already has a request in flight — do not invoke onComplete (would clear their pending flag).
+            if (_liveBoundsReadbackInProgress)
+                return;
+            if (_gpuSurfaceNets == null || _gpuSurfaceNets.VertexBuffer == null || _gpuSurfaceNets.CountersBuffer == null)
+            {
+                onComplete(false, default);
+                return;
+            }
+
+            _liveBoundsReadbackInProgress = true;
+            int sampleCap = Mathf.Max(64, maxSamples);
+
+            AsyncGPUReadback.Request(_gpuSurfaceNets.CountersBuffer, countersRequest =>
+            {
+                if (countersRequest.hasError)
+                {
+                    _liveBoundsReadbackInProgress = false;
+                    onComplete(false, default);
+                    return;
+                }
+
+                var counterData = countersRequest.GetData<uint>();
+                int vertexCount = counterData.Length > 0 ? (int)counterData[0] : 0;
+                if (vertexCount <= 0)
+                {
+                    _liveBoundsReadbackInProgress = false;
+                    onComplete(false, default);
+                    return;
+                }
+
+                int readBytes = vertexCount * GpuVertexStrideBytes;
+                AsyncGPUReadback.Request(_gpuSurfaceNets.VertexBuffer, readBytes, 0, vertexRequest =>
+                {
+                    try
+                    {
+                        if (vertexRequest.hasError)
+                        {
+                            onComplete(false, default);
+                            return;
+                        }
+
+                        var vertexFloats = vertexRequest.GetData<float>();
+                        int floatsPerVertex = GpuVertexStrideBytes / sizeof(float);
+                        int safeVertexCount = Math.Min(vertexCount, vertexFloats.Length / floatsPerVertex);
+                        if (safeVertexCount <= 0)
+                        {
+                            onComplete(false, default);
+                            return;
+                        }
+
+                        int sampleStride = Math.Max(1, safeVertexCount / sampleCap);
+                        Vector3 min = new Vector3(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
+                        Vector3 max = new Vector3(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
+                        int used = 0;
+                        for (int vertexIndex = 0; vertexIndex < safeVertexCount; vertexIndex += sampleStride)
+                        {
+                            int floatIndex = vertexIndex * floatsPerVertex;
+                            Vector3 position = new Vector3(
+                                vertexFloats[floatIndex],
+                                vertexFloats[floatIndex + 1],
+                                vertexFloats[floatIndex + 2]);
+                            if (!IsFinite(position))
+                                continue;
+
+                            min = Vector3.Min(min, position);
+                            max = Vector3.Max(max, position);
+                            used++;
+                        }
+
+                        if (used <= 0)
+                        {
+                            onComplete(false, default);
+                            return;
+                        }
+
+                        Vector3 size = max - min;
+                        // Reject empty / degenerate samples (e.g. single-point early mesh).
+                        if (size.sqrMagnitude < 1e-6f)
+                        {
+                            onComplete(false, default);
+                            return;
+                        }
+
+                        onComplete(true, new Bounds((min + max) * 0.5f, size));
+                    }
+                    finally
+                    {
+                        _liveBoundsReadbackInProgress = false;
+                    }
+                });
+            });
+        }
+
+        private static bool IsFinite(Vector3 value)
+        {
+            return !(float.IsNaN(value.x) || float.IsNaN(value.y) || float.IsNaN(value.z)
+                || float.IsInfinity(value.x) || float.IsInfinity(value.y) || float.IsInfinity(value.z));
         }
 
         /// <summary>

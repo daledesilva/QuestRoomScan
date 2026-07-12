@@ -22,8 +22,22 @@ namespace Genesis.RoomScan
 
         private void Awake()
         {
+            // Visual-only Live HDR scenes must never build a room MeshCollider — even an
+            // empty host that later fills will eject the XR rig and can drop FPS near zero.
+            if (IsLiveHdrTestingScene())
+            {
+                enabled = false;
+                return;
+            }
+
             _roomScanner = GetComponent<RoomScanner>() ?? RoomScanner.Instance;
             EnsureColliderObjects();
+        }
+
+        private static bool IsLiveHdrTestingScene()
+        {
+            string sceneName = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name;
+            return sceneName == "LiveHdrTesting" || sceneName == "LiveHdrTestingTriplanar";
         }
 
         private void OnEnable()
@@ -81,6 +95,32 @@ namespace Genesis.RoomScan
                 colliderObject.transform.SetParent(transform, false);
                 _meshCollider = colliderObject.AddComponent<MeshCollider>();
                 _meshCollider.convex = false;
+            }
+        }
+
+        /// <summary>
+        /// Removes the live MeshCollider host. Live HDR / visual-only scenes call this so an
+        /// empty-then-filled room collider cannot eject the XR rig or stall physics.
+        /// </summary>
+        public void DestroyCollisionHost()
+        {
+            enabled = false;
+
+            if (_meshCollider != null)
+            {
+                _meshCollider.sharedMesh = null;
+                Destroy(_meshCollider.gameObject);
+                _meshCollider = null;
+            }
+
+            Transform colliderHost = transform.Find("RoomScanPhysicsCollider");
+            if (colliderHost != null)
+                Destroy(colliderHost.gameObject);
+
+            if (_collisionMesh != null)
+            {
+                Destroy(_collisionMesh);
+                _collisionMesh = null;
             }
         }
 

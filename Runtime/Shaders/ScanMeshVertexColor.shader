@@ -11,6 +11,8 @@ Shader "Genesis/ScanMeshVertexColor"
             Tags { "LightMode"="SRPDefaultUnlit" }
             ZWrite On
             ZTest LEqual
+            // Room surfaces are viewed from inside; keep both faces for env-map capture coverage.
+            Cull Off
 
             HLSLPROGRAM
             #pragma vertex vert
@@ -58,6 +60,11 @@ Shader "Genesis/ScanMeshVertexColor"
             float _RSWireframe;
             float _RSWireThickness;
             float _RSHiddenFromMainView;
+            // Env-map capture: textured triplanar only — no freeze tint, wireframe, or untextured mesh fill.
+            float _RSEnvMapCapture;
+            // Explicit VP for offscreen cubemap faces — URP ignores CommandBuffer.SetViewProjectionMatrices
+            // for TransformWorldToHClip, which otherwise projects with the XR main camera (atlas-like fragments).
+            float4x4 _RSEnvMapViewProj;
 
             // Live TSDF extraction can drift slightly from the depth texel that
             // wrote the triplanar cache. Keep rejection loose enough for preview.
@@ -102,6 +109,25 @@ Shader "Genesis/ScanMeshVertexColor"
                 return totalAlpha > 0.01 ? rgb : half3(-1, -1, -1);
             }
 
+            half3 SampleTriplanarLoose(float3 worldPos, float3 normal)
+            {
+                float3 absN   = abs(normal);
+                float3 blend  = absN / (absN.x + absN.y + absN.z + 0.001);
+                float3 uvw    = WorldToVoxelUVW(worldPos);
+
+                float2 uvXZ = SignedTriUV(uvw.xz, normal.y);
+                float2 uvXY = SignedTriUV(uvw.xy, normal.z);
+                float2 uvYZ = SignedTriUV(uvw.yz, normal.x);
+
+                half4 colXZ = SAMPLE_TEXTURE2D(_RSTriXZ, sampler_RSTriXZ, uvXZ);
+                half4 colXY = SAMPLE_TEXTURE2D(_RSTriXY, sampler_RSTriXY, uvXY);
+                half4 colYZ = SAMPLE_TEXTURE2D(_RSTriYZ, sampler_RSTriYZ, uvYZ);
+
+                half3 rgb = colXZ.rgb * blend.y + colXY.rgb * blend.z + colYZ.rgb * blend.x;
+                half totalAlpha = colXZ.a * blend.y + colXY.a * blend.z + colYZ.a * blend.x;
+                return totalAlpha > 0.01 ? rgb : half3(-1, -1, -1);
+            }
+
             bool IsVoxelFrozen(float3 worldPos)
             {
                 float3 uvw = WorldToVoxelUVW(worldPos);
@@ -135,7 +161,11 @@ Shader "Genesis/ScanMeshVertexColor"
                 GPUVertex gv = _SurfaceVerts[idx];
 
                 OUT.positionWS  = gv.pos;
-                OUT.positionHCS = TransformWorldToHClip(gv.pos);
+                // Offscreen env bake must not use TransformWorldToHClip — that reads XR eye VP under URP.
+                if (_RSEnvMapCapture > 0.5)
+                    OUT.positionHCS = mul(_RSEnvMapViewProj, float4(gv.pos, 1.0));
+                else
+                    OUT.positionHCS = TransformWorldToHClip(gv.pos);
                 OUT.normalWS    = gv.norm;
                 OUT.color       = UnpackColor(gv.packedColor);
 
@@ -150,7 +180,9 @@ Shader "Genesis/ScanMeshVertexColor"
             half4 frag(Varyings IN) : SV_Target
             {
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(IN);
-                if (_RSHiddenFromMainView > 0.5)
+                bool envMapCapture = _RSEnvMapCapture > 0.5;
+                // Env-map bake force-draws the mesh; do not discard when HiddenFromMainView is set.
+                if (!envMapCapture && _RSHiddenFromMainView > 0.5)
                     discard;
 
                 float3 normal = normalize(IN.normalWS);
@@ -160,10 +192,18 @@ Shader "Genesis/ScanMeshVertexColor"
                 half3 baseColor;
                 if (_RSTriAvailable > 0.5)
                 {
-                    half3 tri = SampleTriplanar(IN.positionWS, normal);
+                    // Env capture uses loose triplanar (no depth reject) for fuller cubemap coverage.
+                    half3 tri = envMapCapture
+                        ? SampleTriplanarLoose(IN.positionWS, normal)
+                        : SampleTriplanar(IN.positionWS, normal);
                     if (tri.r >= 0)
                     {
                         baseColor = tri;
+                    }
+                    else if (envMapCapture)
+                    {
+                        // Prefer texture; fall back to vertex color so sparse triplanar does not blank the cubemap.
+                        baseColor = IN.color.rgb;
                     }
                     else
                     {
@@ -172,6 +212,11 @@ Shader "Genesis/ScanMeshVertexColor"
                         baseColor = IN.color.rgb;
                         showUntexturedWireframe = true;
                     }
+                }
+                else if (envMapCapture)
+                {
+                    // Triplanar not published yet — still capture mesh albedo (no wireframe/freeze).
+                    baseColor = IN.color.rgb;
                 }
                 else if (_RSNormalFallback > 0.5)
                 {
@@ -182,11 +227,12 @@ Shader "Genesis/ScanMeshVertexColor"
                     baseColor = IN.color.rgb;
                 }
 
-                // 2. Apply freeze tint
-                baseColor = ApplyFreezeTint(baseColor, IN.positionWS);
+                // 2. Apply freeze tint (skipped during env-map capture)
+                if (!envMapCapture)
+                    baseColor = ApplyFreezeTint(baseColor, IN.positionWS);
 
                 // 3. Wireframe: discard interior, white edges blending to vertex color at vertices
-                if (_RSWireframe > 0.5 || showUntexturedWireframe)
+                if (!envMapCapture && (_RSWireframe > 0.5 || showUntexturedWireframe))
                 {
                     float thickness = max(_RSWireThickness, 0.2);
                     float3 bary = IN.barycentric;
